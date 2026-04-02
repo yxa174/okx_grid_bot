@@ -37,6 +37,7 @@ import threading
 import time
 from datetime import datetime
 from collections import deque
+
 import numpy as np
 import pandas as pd
 from pybit.unified_trading import HTTP
