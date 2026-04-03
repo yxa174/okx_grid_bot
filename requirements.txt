@@ -1,0 +1,7 @@
+python-okx
+python-telegram-bot
+numpy
+pandas
+torch
+requests
+python-dotenv
