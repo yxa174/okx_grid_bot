@@ -27,7 +27,7 @@ ALLOWED_CHAT_IDS: list[int] = (
 
 CONFIG: dict = {
     # ── Инструмент ────────────────────────────────────────────────
-    "symbol":           "SOL-USDT",  # Spot trading
+    "symbol":           "SOL-USDT-SWAP",  # Futures trading
 
     # ── Сетка ─────────────────────────────────────────────────────
     "grid_levels":      20,

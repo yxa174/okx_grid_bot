@@ -1121,7 +1121,7 @@ class GridBotV3:
     @retry_api()
     def get_open_order_count(self) -> int:
         try:
-            r = self.trade_api.get_order_list(instType="SPOT", instId=CONFIG["symbol"], state="live")
+            r = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
             self._check_okx_response(r)
             return len(r["data"])
         except Exception:
@@ -1193,7 +1193,7 @@ class GridBotV3:
         try:
             r = self.trade_api.place_order(
                 instId=CONFIG["symbol"],
-                tdMode="cash",  # Spot mode
+                tdMode="isolated",
                 side="buy",
                 ordType="limit",
                 sz=str(qty),
@@ -1222,7 +1222,7 @@ class GridBotV3:
         try:
             r = self.trade_api.place_order(
                 instId=CONFIG["symbol"],
-                tdMode="cash",  # Spot mode
+                tdMode="isolated",
                 side="sell",
                 ordType="limit",
                 sz=str(qty),
@@ -1249,7 +1249,7 @@ class GridBotV3:
         try:
             r = self.trade_api.place_order(
                 instId=CONFIG["symbol"],
-                tdMode="cash",
+                tdMode="isolated",
                 side="sell",
                 ordType="market",
                 sz=str(round_qty(sol_holdings)),
@@ -1261,7 +1261,7 @@ class GridBotV3:
 
     def cancel_all(self):
         try:
-            r = self.trade_api.cancel_all_orders(instType="SPOT", instId=CONFIG["symbol"])
+            r = self.trade_api.cancel_all_orders(instType="SWAP", instId=CONFIG["symbol"])
             self._check_okx_response(r)
         except Exception:
             pass
@@ -1332,7 +1332,7 @@ class GridBotV3:
 
     def check_filled(self):
         try:
-            r = self.trade_api.get_order_list(instType="SPOT", instId=CONFIG["symbol"], state="live")
+            r = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
             self._check_okx_response(r)
             open_ids = {o["ordId"] for o in r["data"]}
         except Exception as e:
