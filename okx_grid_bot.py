@@ -187,59 +187,15 @@ class MarketDataProvider:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  LSTM / AI ANALYZER
+#  AI ANALYZER (технические индикаторы)
 # ══════════════════════════════════════════════════════════════════
 
-if TORCH_AVAILABLE:
-    class LSTMModel(torch.nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers, dropout):
-            super().__init__()
-            self.gru = torch.nn.GRU(input_size, hidden_size, num_layers,
-                                     batch_first=True, dropout=dropout if num_layers > 1 else 0)
-            self.bn = torch.nn.BatchNorm1d(hidden_size)
-            self.drop = torch.nn.Dropout(dropout)
-            self.fc1 = torch.nn.Linear(hidden_size, 32)
-            self.relu = torch.nn.ReLU()
-            self.fc2 = torch.nn.Linear(32, 1)
-            self.sig = torch.nn.Sigmoid()
-
-        def forward(self, x):
-            out, _ = self.gru(x)
-            out = self.bn(out[:, -1, :])
-            out = self.drop(self.relu(self.fc1(out)))
-            return self.sig(self.fc2(out))
-
-
 class AIAnalyzer:
-    def __init__(self, model_path="lstm_ensemble.pt"):
+    def __init__(self):
         self.price_history = deque(maxlen=200)
         self.volume_history = deque(maxlen=200)
         self.feature_buffer = deque(maxlen=200)
-        self.ensemble = []
-        self.seq_len = 60
-        self.scaler = None
-        self.n_models = 0
-        self._load_ensemble(model_path)
-
-    def _load_ensemble(self, path):
-        if not TORCH_AVAILABLE:
-            log.info("PyTorch недоступен — LSTM отключён")
-            return
-        try:
-            ck = torch.load(path, map_location="cpu", weights_only=False)
-            self.seq_len = ck.get("seq_len", 60)
-            self.scaler = ck["scaler"]
-            self.n_models = ck["n_models"]
-            input_size = ck["input_size"]
-            for i in range(self.n_models):
-                cfg = ck["model_configs"][i]
-                m = LSTMModel(input_size, cfg["hidden"], cfg["layers"], cfg["dropout"])
-                m.load_state_dict(ck["models"][i])
-                m.eval()
-                self.ensemble.append(m)
-            log.info(f"🧠 LSTM ансамбль загружен: {self.n_models} моделей")
-        except Exception as e:
-            log.warning(f"LSTM не загружен: {e}")
+        log.info("AI Analyzer инициализирован (без LSTM)")
 
     def add_price(self, price: float, volume: float = 0.0):
         self.price_history.append(price)
@@ -290,17 +246,8 @@ class AIAnalyzer:
                 atr_ratio, ma_trend, vol_ratio]
 
     def get_lstm_signal(self) -> float:
-        if not TORCH_AVAILABLE or not self.ensemble or len(self.feature_buffer) < self.seq_len:
-            return 0.5
-        arr = np.array(list(self.feature_buffer)[-self.seq_len:], dtype=np.float32)
-        if self.scaler:
-            arr = self.scaler.transform(arr)
-        x = torch.FloatTensor(arr).unsqueeze(0)
-        probs = []
-        with torch.no_grad():
-            for m in self.ensemble:
-                probs.append(float(m(x).item()))
-        return round(sum(probs) / len(probs), 3)
+        # Без LSTM возвращаем нейтральный сигнал
+        return 0.5
 
     def get_indicators(self) -> dict:
         if len(self.price_history) < 50:
@@ -325,6 +272,32 @@ class AIAnalyzer:
         }
 
     def get_signal(self) -> dict:
+        ind = self.get_indicators()
+        if not ind:
+            return {"signal": "NEUTRAL", "score": 0, "lstm": 0.5, "indicators": {}}
+        score = 0
+        rsi = ind["rsi"]
+        if rsi < 25: score += 3
+        elif rsi < 35: score += 2
+        elif rsi < 45: score += 1
+        elif rsi > 75: score -= 3
+        elif rsi > 65: score -= 2
+        elif rsi > 55: score -= 1
+        if ind["macd_hist"] > 0: score += 1
+        else: score -= 1
+        lstm = self.get_lstm_signal()
+        if lstm > 0.65: score += 2
+        elif lstm > 0.55: score += 1
+        elif lstm < 0.35: score -= 2
+        elif lstm < 0.45: score -= 1
+        if score >= 4: signal = "STRONG_BUY"
+        elif score >= 2: signal = "BUY"
+        elif score <= -4: signal = "STRONG_SELL"
+        elif score <= -2: signal = "SELL"
+        else: signal = "NEUTRAL"
+        return {"signal": signal, "score": score, "lstm": lstm, "indicators": ind}
+
+    def analyze(self, provider: str = "gemini") -> dict:
         ind = self.get_indicators()
         if not ind:
             return {"signal": "NEUTRAL", "score": 0, "lstm": 0.5, "indicators": {}}
@@ -703,8 +676,27 @@ class AIEnsemble:
                 ])
 
     def _build_prompt(self, price: float, indicators: dict, position_size: float,
-                      realized_pnl: float, grid_lower: float, grid_upper: float) -> str:
+                      realized_pnl: float, grid_lower: float, grid_upper: float,
+                      provider: str = None) -> str:
+        """Создаёт промт для AI с учётом стратегии провайдера"""
         ctx = self.market.get_market_context(price)
+        
+        # Получаем стратегию для провайдера
+        strategies = CONFIG.get("ai_strategies", {})
+        if provider and provider in strategies:
+            strategy = strategies[provider]
+            role = strategy.get("role", CONFIG.get("ai_role"))
+            style = strategy.get("style", CONFIG.get("ai_style"))
+            risk = strategy.get("risk", CONFIG.get("ai_risk"))
+            instruction = strategy.get("instruction", "")
+            min_conf = strategy.get("min_confidence", 0.6)
+        else:
+            role = CONFIG.get("ai_role", "профессиональный крипто-трейдер")
+            style = CONFIG.get("ai_style", "свинг-трейдинг")
+            risk = CONFIG.get("ai_risk", "умеренный")
+            instruction = ""
+            min_conf = 0.6
+        
         memory_text = ""
         if self.memory:
             recent = list(self.memory)[-5:]
@@ -722,10 +714,9 @@ class AIEnsemble:
             if len(prices) > 10:
                 price_change_24h = ((prices[-1] - prices[-10]) / prices[-10]) * 100
 
-        return f"""Ты {CONFIG.get('ai_role', 'профессиональный крипто-трейдер')}.
-Стиль: {CONFIG.get('ai_style', 'свинг-трейдинг')}.
-Риск-профиль: {CONFIG.get('ai_risk', 'умеренный')}.
-Таймфрейм: {CONFIG.get('ai_timeframe', '4H')}.
+        prompt = f"""Ты {role}.
+Стиль: {style}.
+Риск-профиль: {risk}.
 
 📊 ТЕКУЩИЕ ДАННЫЕ SOL/USDT:
 Цена: ${price:.2f} | Изм: {price_change_24h:+.1f}%
@@ -748,14 +739,20 @@ MA20: {indicators.get('ma20', '—')} | MA50: {indicators.get('ma50', '—')}
 Размер: {position_size:.2f} SOL | PnL: {realized_pnl:+.2f} USDT
 Сетка: {grid_lower:.2f} — {grid_upper:.2f}{memory_text}
 
+🔥 СТРАТЕГИЯ:
+{instruction}
+
 Задача: Верни сигнал STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL
 и confidence от 0.0 до 1.0.
+Минимальная уверенность для сигнала: {min_conf}
 Кратко обоснуй (1-2 предложения).
 
 Формат ответа:
 Signal: <сигнал>
 Confidence: <0.0-1.0>
 Reasoning: <обоснование>"""
+        
+        return prompt
 
     def analyze(self, price: float, indicators: dict, position_size: float,
                 realized_pnl: float, grid_lower: float, grid_upper: float) -> dict:
@@ -765,22 +762,19 @@ Reasoning: <обоснование>"""
             return self._get_last_ensemble()
 
         self.last_analysis_time = now
-        prompt = self._build_prompt(price, indicators, position_size, realized_pnl, grid_lower, grid_upper)
         results = {}
         enabled = CONFIG.get("ai_enabled_providers", ["groq", "openrouter", "cohere", "deepseek"])
 
+        # Каждый провайдер получает свой уникальный промт
         for name in enabled:
             provider = self.providers.get(name)
             if provider:
+                # Создаём промт для конкретного провайдера с его стратегией
+                prompt = self._build_prompt(
+                    price, indicators, position_size, realized_pnl, 
+                    grid_lower, grid_upper, provider=name
+                )
                 results[name] = provider.get_signal(prompt)
-
-        lstm_val = self.ai.get_lstm_signal()
-        if lstm_val > 0.65:
-            results["lstm"] = {"signal": "BUY", "confidence": lstm_val, "reasoning": f"LSTM={lstm_val:.2f}"}
-        elif lstm_val < 0.35:
-            results["lstm"] = {"signal": "SELL", "confidence": 1 - lstm_val, "reasoning": f"LSTM={lstm_val:.2f}"}
-        else:
-            results["lstm"] = {"signal": "NEUTRAL", "confidence": 0.5, "reasoning": f"LSTM={lstm_val:.2f}"}
 
         self.last_llm_results = results
         ensemble = self._vote(results)
@@ -1023,7 +1017,7 @@ class GridBotV3:
         self._tg_notify = None
         self._tg_app = None
 
-        self.ai = AIAnalyzer("lstm_ensemble.pt")
+        self.ai = AIAnalyzer()
         self.market = MarketDataProvider()
         self.ensemble = AIEnsemble(self.ai, self.market)
         self.backtester = Backtester(self.ensemble)
