@@ -4,3 +4,5 @@ __pycache__/
 *.log
 *.pyc
 lstm_ensemble.pt
+train_lstm.py
+grid_bot_v2.log

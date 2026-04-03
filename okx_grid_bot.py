@@ -1,6 +1,6 @@
 """
-OKX TESTNET — SPOT LONG-ONLY GRID BOT v3 (MULTI-AI)
-=====================================================
+OKX TESTNET — SPOT GRID BOT V3 (MULTI-AI)
+==========================================
 Архитектура:
 
 1. СПОТОВАЯ ТОРГОВЛЯ (Spot, без плеча)
@@ -12,7 +12,6 @@ OKX TESTNET — SPOT LONG-ONLY GRID BOT v3 (MULTI-AI)
 3. TRAILING UP (Следование вверх)
 4. ГЛОБАЛЬНЫЙ STOP-LOSS / TAKE-PROFIT
 5. МУЛЬТИ-AI АНАЛИЗ:
-   - LSTM ансамбль (локальная модель)
    - Gemini 2.0 Flash
    - Groq (Llama 3.1 70B)
    - OpenRouter (Llama 3 8B, free)
@@ -20,7 +19,7 @@ OKX TESTNET — SPOT LONG-ONLY GRID BOT v3 (MULTI-AI)
    - DeepSeek V3 (free tier)
    - Адаптивные веса, память 20 решений
    - Внешние данные: Fear&Greed, BTC, корреляция, сессии
-6. BACKTESTING точности нейронк
+6. BACKTESTING точности AI
 """
 
 import asyncio
@@ -43,6 +42,7 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    print("⚠️ PyTorch не установлен — LSTM отключён")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -1651,19 +1651,18 @@ def ai_settings_keyboard():
     ])
 
 
-HELP_TEXT = (
+help_text = (
     "🤖 *Grid Bot V3 — Spot Multi-AI (OKX Testnet)*\n\n"
     "📌 *Стратегия:*\n"
     "Спотовая торговля без плеча.\n"
     "Покупаем SOL дешевле, продаём дороже.\n"
     "Нет плеча → нет риска ликвидации.\n\n"
     "📌 *Multi-AI:*\n"
-    "• LSTM ансамбль (локальная модель)\n"
     "• Gemini 2.0 Flash\n"
     "• Groq Llama 3.1 70B\n"
     "• OpenRouter Llama 3 8B (free)\n"
-     "• Cohere Command R+ (free tier)\n"
-     "• DeepSeek V3 (free tier)\n"
+    "• Cohere Command R+ (free tier)\n"
+    "• DeepSeek V3 (free tier)\n"
     "• Адаптивные веса + память 20 решений\n"
     "• Fear&Greed, BTC корреляция, сессии\n\n"
     "📌 *Команды:*\n"
