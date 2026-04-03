@@ -1049,7 +1049,10 @@ class GridBotV3:
         return None
 
     def setup_account(self):
-        log.info("✅ Спотовый режим (без плеча)")
+        if "-SWAP" in CONFIG["symbol"]:
+            log.info("⚡ Фьючерсный режим (с плечом)")
+        else:
+            log.info("✅ Спотовый режим (без плеча)")
 
     @retry_api()
     def get_price(self) -> float:
