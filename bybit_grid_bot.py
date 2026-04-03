@@ -999,32 +999,78 @@ def auth(update: Update) -> bool:
     return not ALLOWED_CHAT_IDS or update.effective_chat.id in ALLOWED_CHAT_IDS
 
 
-def keyboard():
+def main_keyboard():
+    """Главное меню"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Старт",       callback_data="start"),
-         InlineKeyboardButton("⏹ Стоп",         callback_data="stop")],
+        [InlineKeyboardButton("▶️ Запустить",       callback_data="start"),
+         InlineKeyboardButton("⏹ Остановить",       callback_data="stop")],
         [InlineKeyboardButton("🚨 Экстренный стоп", callback_data="estop")],
-        [InlineKeyboardButton("📊 Статус",       callback_data="status"),
-         InlineKeyboardButton("💰 Баланс",       callback_data="balance")],
-        [InlineKeyboardButton("⚙️ Параметры",    callback_data="params")],
+        [InlineKeyboardButton("📊 Статус",          callback_data="status"),
+         InlineKeyboardButton("💰 Баланс",          callback_data="balance")],
+        [InlineKeyboardButton("📋 Ордера",          callback_data="orders"),
+         InlineKeyboardButton("🧠 AI Сигнал",       callback_data="ai_signal")],
+        [InlineKeyboardButton("⚙️ Настройки",       callback_data="settings")],
     ])
+
+
+def settings_keyboard():
+    """Подменю настроек"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 Stop-Loss",       callback_data="set_sl"),
+         InlineKeyboardButton("🎯 Take-Profit",     callback_data="set_tp")],
+        [InlineKeyboardButton("📐 Уровни сетки",    callback_data="set_levels"),
+         InlineKeyboardButton("📊 ATR множитель",   callback_data="set_atr")],
+        [InlineKeyboardButton("💲 Плечо",           callback_data="set_leverage"),
+         InlineKeyboardButton("📦 Макс qty",        callback_data="set_maxqty")],
+        [InlineKeyboardButton("🔙 Назад",           callback_data="back_main")],
+    ])
+
+
+def quick_settings_keyboard():
+    """Быстрые настройки после выбора параметра"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Назад",           callback_data="settings")],
+    ])
+
+
+HELP_TEXT = (
+    "🤖 *Grid Bot V2 — Long Only*\n\n"
+    "📌 *Стратегия:*\n"
+    "Покупаем на падении, продаём на росте.\n"
+    "Нет шортов → нет риска при росте цены.\n\n"
+    "📌 *Как работает:*\n"
+    "• Сетка строится по ATR (волатильность)\n"
+    "• AI анализирует рынок и корректирует входы\n"
+    "• Автоматический trailing за ценой\n\n"
+    "📌 *Команды:*\n"
+    "`/start` — главное меню\n"
+    "`/status` — быстрый статус\n"
+    "`/help` — эта справка\n"
+    "`/set param value` — изменить параметр\n\n"
+    "Выбери действие:"
+)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     await update.message.reply_text(
-        "🤖 *Grid Bot V2 — Long Only*\n\n"
-        "Стратегия: покупаем на падении, продаём на росте.\n"
-        "Нет шортов → нет риска при росте цены.\n\n"
-        "Выбери действие:",
-        parse_mode="Markdown", reply_markup=keyboard()
+        HELP_TEXT,
+        parse_mode="Markdown", reply_markup=main_keyboard()
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    await update.message.reply_text(
+        HELP_TEXT,
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     await update.message.reply_text(
-        bot.status_text(), parse_mode="Markdown", reply_markup=keyboard()
+        bot.status_text(), parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 
@@ -1032,7 +1078,19 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     args = ctx.args
     if len(args) != 2:
-        await update.message.reply_text("Использование: `/set param value`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Использование: `/set param value`\n\n"
+            "Доступные параметры:\n"
+            "`global_sl_usdt` — стоп-лосс (USDT)\n"
+            "`global_tp_usdt` — тейк-профит (USDT)\n"
+            "`grid_levels` — кол-во уровней\n"
+            "`atr_multiplier` — множитель ATR\n"
+            "`leverage` — плечо\n"
+            "`max_qty` — макс. qty на ордер\n"
+            "`max_balance_pct` — % баланса\n"
+            "`min_balance_usdt` — мин. баланс",
+            parse_mode="Markdown"
+        )
         return
     key, val = args[0], args[1]
     if key not in CONFIG:
@@ -1043,11 +1101,30 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif isinstance(CONFIG[key], int):  CONFIG[key] = int(val)
         else:                               CONFIG[key] = float(val)
         await update.message.reply_text(
-            f"✅ `{key}` = `{CONFIG[key]}`\n\nПерезапусти бот для применения.",
-            parse_mode="Markdown"
+            f"✅ `{key}` = `{CONFIG[key]}`",
+            parse_mode="Markdown", reply_markup=main_keyboard()
         )
     except ValueError:
         await update.message.reply_text("❌ Неверное значение")
+
+
+def format_settings_page() -> str:
+    """Форматирует страницу настроек"""
+    return (
+        "⚙️ *Настройки бота*\n\n"
+        f"📊 Пара: `{CONFIG['symbol']}`\n"
+        f"🔢 Уровней: `{CONFIG['grid_levels']}`\n"
+        f"📐 ATR множитель: `{CONFIG.get('atr_multiplier', 2.5)}`\n"
+        f"💲 Плечо: `{CONFIG['leverage']}x`\n"
+        f"📦 Макс qty: `{CONFIG['max_qty']}` SOL\n"
+        f"💰 % Баланса: `{CONFIG['max_balance_pct']*100:.0f}%`\n\n"
+        f"🔒 Stop-Loss: `-{CONFIG.get('global_sl_usdt', 30):.0f} USDT`\n"
+        f"🎯 Take-Profit: `+{CONFIG.get('global_tp_usdt', 50):.0f} USDT`\n"
+        f"⚠️ Мин. баланс: `{CONFIG.get('min_balance_usdt', 50):.0f} USDT`\n\n"
+        f"🔄 Интервал: `{CONFIG['check_interval']}с`\n"
+        f"📏 Шаг qty: `{CONFIG['qty_step']}`\n\n"
+        "Выбери параметр для изменения:"
+    )
 
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1059,55 +1136,236 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "start":
         ok = bot.start()
-        await q.edit_message_text(
-            "▶️ Бот запущен! Строю сетку..." if ok else "⚠️ Уже работает.",
-            reply_markup=keyboard()
-        )
+        if ok:
+            await q.edit_message_text(
+                "✅ *Бот запущен!*\n\n"
+                "🔄 Строю сетку ордеров...\n"
+                "🧠 AI анализирует рынок...\n"
+                "🛡 Защиты активны.",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
+        else:
+            await q.edit_message_text(
+                "⚠️ *Бот уже работает!*\n\n"
+                "Используй /status для проверки.",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
 
     elif q.data == "stop":
         ok = bot.stop()
-        await q.edit_message_text(
-            "⏹ Бот остановлен. Позиции остаются открытыми." if ok else "Не запущен.",
-            reply_markup=keyboard()
-        )
+        if ok:
+            await q.edit_message_text(
+                "⏹ *Бот остановлен*\n\n"
+                "📋 Ордера отменены\n"
+                "📍 Позиции остаются открытыми\n\n"
+                "Для закрытия позиций используй 🚨 Экстренный стоп",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
+        else:
+            await q.edit_message_text(
+                "ℹ️ *Бот не запущен*\n\n"
+                "Нажми ▶️ Запустить для старта.",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
 
     elif q.data == "estop":
         bot.emergency_stop()
         await q.edit_message_text(
-            "🚨 Экстренная остановка!\nВсе ордера отменены, позиции закрыты.",
-            reply_markup=keyboard()
+            "🚨 *ЭКСТРЕННАЯ ОСТАНОВКА!*\n\n"
+            "❌ Все ордера отменены\n"
+            "📉 Позиции закрыты по рынку\n"
+            "🛑 Бот остановлен\n\n"
+            "Проверь баланс командой 💰 Баланс",
+            parse_mode="Markdown", reply_markup=main_keyboard()
         )
 
     elif q.data == "status":
         await q.edit_message_text(
-            bot.status_text(), parse_mode="Markdown", reply_markup=keyboard()
+            bot.status_text(), parse_mode="Markdown", reply_markup=main_keyboard()
         )
 
     elif q.data == "balance":
         unrealized = bot.get_unrealized_pnl()
+        balance = bot.get_balance()
+        avail = bot.get_available_balance()
+        pos_size = bot.get_position_size()
+        price = bot.get_price()
+
+        margin_used = balance - avail if balance > avail else 0
+
         await q.edit_message_text(
-            f"💰 *Баланс*\n\n"
-            f"USDT: `{bot.get_balance():.2f}`\n"
-            f"Цена SOL: `{bot.get_price():.2f}`\n"
-            f"Позиция: `{bot.get_position_size():.1f} SOL`\n"
-            f"PnL реализованный: `{bot.realized_pnl:+.4f} USDT`\n"
-            f"PnL нереализованный: `{unrealized:+.4f} USDT`\n"
-            f"PnL итого: `{bot.realized_pnl + unrealized:+.4f} USDT`",
-            parse_mode="Markdown", reply_markup=keyboard()
+            f"💰 *Баланс и позиция*\n\n"
+            f"💵 Общий баланс: `{balance:.2f} USDT`\n"
+            f"💳 Доступно: `{avail:.2f} USDT`\n"
+            f"🔒 В марже: `{margin_used:.2f} USDT`\n\n"
+            f"📍 Позиция: `{pos_size:.2f} SOL`\n"
+            f"💲 Цена SOL: `{price:.2f} USDT`\n"
+            f"📊 Стоимость: `{pos_size * price:.2f} USDT`\n\n"
+            f"📈 PnL реализованный: `{bot.realized_pnl:+.4f} USDT`\n"
+            f"📉 PnL нереализованный: `{unrealized:+.4f} USDT`\n"
+            f"💎 *Итого: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
+            parse_mode="Markdown", reply_markup=main_keyboard()
+        )
+
+    elif q.data == "orders":
+        buys = {k: v for k, v in bot.active_orders.items() if v["type"] == "BUY"}
+        sells = {k: v for k, v in bot.active_orders.items() if v["type"] == "SELL"}
+
+        text = "📋 *Открытые ордера*\n\n"
+
+        if buys:
+            text += f"🟢 *BUY ордера ({len(buys)})*\n"
+            sorted_buys = sorted(buys.items(), key=lambda x: x[1]["price"], reverse=True)
+            for oid, order in sorted_buys[:5]:
+                text += f"  `{order['price']:.2f}` × `{order['qty']}`\n"
+            if len(buys) > 5:
+                text += f"  ... и ещё {len(buys) - 5}\n"
+            text += "\n"
+        else:
+            text += "🟢 BUY ордеров: `нет`\n\n"
+
+        if sells:
+            text += f"🔴 *SELL ордера ({len(sells)})*\n"
+            sorted_sells = sorted(sells.items(), key=lambda x: x[1]["price"])
+            for oid, order in sorted_sells[:5]:
+                text += f"  `{order['price']:.2f}` × `{order['qty']}`\n"
+            if len(sells) > 5:
+                text += f"  ... и ещё {len(sells) - 5}\n"
+            text += "\n"
+        else:
+            text += "🔴 SELL ордеров: `нет`\n\n"
+
+        try:
+            open_count = bot.get_open_order_count()
+            text += f"📊 Всего на бирже: `{open_count}` / `50`"
+        except Exception:
+            pass
+
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+
+    elif q.data == "ai_signal":
+        sig = bot.last_signal
+        ind = sig.get("indicators", {})
+        emoji = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(sig.get("signal", "NEUTRAL"), "⚪")
+
+        text = (
+            f"🧠 *AI Сигнал*\n\n"
+            f"{emoji} *{sig.get('signal', '—')}*\n"
+            f"Score: `{sig.get('score', 0)}`\n"
+            f"LSTM: `{sig.get('lstm', 0.5):.3f}`\n\n"
+        )
+
+        if ind:
+            text += (
+                f"📊 *Индикаторы:*\n"
+                f"RSI: `{ind.get('rsi', '—')}`\n"
+                f"MACD: `{ind.get('macd_hist', '—')}`\n"
+                f"MA20: `{ind.get('ma20', '—')}`\n"
+                f"MA50: `{ind.get('ma50', '—')}`\n"
+                f"BB верх: `{ind.get('bb_upper', '—')}`\n"
+                f"BB низ: `{ind.get('bb_lower', '—')}`\n"
+            )
+
+        text += (
+            f"\n📌 *Влияние на бота:*\n"
+        )
+        signal = sig.get("signal", "NEUTRAL")
+        if signal == "STRONG_BUY":
+            text += "• Полные BUY ордера\n• Максимальный объём"
+        elif signal == "BUY":
+            text += "• Полные BUY ордера\n• Стандартный объём"
+        elif signal == "NEUTRAL":
+            text += "• Стандартные BUY ордера\n• Без корректировок"
+        elif signal == "SELL":
+            text += "• BUY ордера с qty × 0.5\n• Уменьшенный объём"
+        elif signal == "STRONG_SELL":
+            text += "• BUY ордера НЕ ставятся\n• Только SELL для позиций"
+
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+
+    elif q.data == "settings":
+        await q.edit_message_text(
+            format_settings_page(),
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    # ── Настройки: выбор параметра ──
+
+    elif q.data == "set_sl":
+        await q.edit_message_text(
+            f"🔒 *Stop-Loss*\n\n"
+            f"Текущее значение: `-{CONFIG.get('global_sl_usdt', 30):.0f} USDT`\n\n"
+            f"Если unrealized убыток превысит этот порог,\n"
+            f"бот закроет все позиции и остановится.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set global_sl_usdt 30`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "set_tp":
+        await q.edit_message_text(
+            f"🎯 *Take-Profit*\n\n"
+            f"Текущее значение: `+{CONFIG.get('global_tp_usdt', 50):.0f} USDT`\n\n"
+            f"Если реализованная прибыль превысит этот порог,\n"
+            f"бот зафиксирует прибыль и остановится.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set global_tp_usdt 60`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "set_levels":
+        await q.edit_message_text(
+            f"📐 *Уровни сетки*\n\n"
+            f"Текущее значение: `{CONFIG['grid_levels']}`\n\n"
+            f"Количество уровней определяет плотность сетки.\n"
+            f"Больше уровней = больше ордеров = больше сделок.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set grid_levels 25`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "set_atr":
+        await q.edit_message_text(
+            f"📊 *ATR Множитель*\n\n"
+            f"Текущее значение: `{CONFIG.get('atr_multiplier', 2.5)}`\n\n"
+            f"Диапазон сетки = ATR × множитель.\n"
+            f"Больше = шире диапазон = реже трейлинг.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set atr_multiplier 3.0`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "set_leverage":
+        await q.edit_message_text(
+            f"💲 *Плечо*\n\n"
+            f"Текущее значение: `{CONFIG['leverage']}x`\n\n"
+            f"⚠️ Высокое плечо увеличивает риски!\n"
+            f"Рекомендуется: 3x-10x для тестнета.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set leverage 5`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "set_maxqty":
+        await q.edit_message_text(
+            f"📦 *Максимальный qty*\n\n"
+            f"Текущее значение: `{CONFIG['max_qty']}` SOL\n\n"
+            f"Максимальное количество SOL на один ордер.\n\n"
+            f"Отправь новое значение:\n"
+            f"`/set max_qty 1.0`",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
+
+    elif q.data == "back_main":
+        await q.edit_message_text(
+            "⬅️ *Главное меню*",
+            parse_mode="Markdown", reply_markup=main_keyboard()
         )
 
     elif q.data == "params":
         await q.edit_message_text(
-            f"⚙️ *Параметры*\n\n"
-            f"Пара: `{CONFIG['symbol']}`\n"
-            f"Уровней: `{CONFIG['grid_levels']}`\n"
-            f"Макс qty: `{CONFIG['max_qty']}`\n"
-            f"ATR множитель: `{CONFIG.get('atr_multiplier', 2.5)}`\n"
-            f"Плечо: `{CONFIG['leverage']}`\n"
-            f"Глобальный SL: `-{CONFIG.get('global_sl_usdt', 30)} USDT`\n"
-            f"Глобальный TP: `+{CONFIG.get('global_tp_usdt', 50)} USDT`\n\n"
-            f"Изменить: `/set global_sl_usdt 50`",
-            parse_mode="Markdown", reply_markup=keyboard()
+            format_settings_page(),
+            parse_mode="Markdown", reply_markup=settings_keyboard()
         )
 
 
@@ -1134,8 +1392,19 @@ def main():
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("set",    cmd_set))
     app.add_handler(CallbackQueryHandler(callback_handler))
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("start", "Главное меню"),
+            ("status", "Быстрый статус"),
+            ("help", "Справка"),
+            ("set", "Изменить параметр"),
+        ])
+
+    app.post_init = post_init
 
     # Автостарт при запуске из консоли
     bot.start()
