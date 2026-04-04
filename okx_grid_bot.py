@@ -256,10 +256,6 @@ class AIAnalyzer:
                 macd_hist, bb_width, bb_pos, obv_norm, momentum,
                 atr_ratio, ma_trend, vol_ratio]
 
-    def get_lstm_signal(self) -> float:
-        # Без LSTM возвращаем нейтральный сигнал
-        return 0.5
-
     def get_indicators(self) -> dict:
         if len(self.price_history) < 50:
             return {}
@@ -285,7 +281,7 @@ class AIAnalyzer:
     def get_signal(self) -> dict:
         ind = self.get_indicators()
         if not ind:
-            return {"signal": "NEUTRAL", "score": 0, "lstm": 0.5, "indicators": {}}
+            return {"signal": "NEUTRAL", "score": 0, "indicators": {}}
         score = 0
         rsi = ind["rsi"]
         if rsi < 25: score += 3
@@ -296,43 +292,12 @@ class AIAnalyzer:
         elif rsi > 55: score -= 1
         if ind["macd_hist"] > 0: score += 1
         else: score -= 1
-        lstm = self.get_lstm_signal()
-        if lstm > 0.65: score += 2
-        elif lstm > 0.55: score += 1
-        elif lstm < 0.35: score -= 2
-        elif lstm < 0.45: score -= 1
         if score >= 4: signal = "STRONG_BUY"
         elif score >= 2: signal = "BUY"
         elif score <= -4: signal = "STRONG_SELL"
         elif score <= -2: signal = "SELL"
         else: signal = "NEUTRAL"
-        return {"signal": signal, "score": score, "lstm": lstm, "indicators": ind}
-
-    def analyze(self, provider: str = "gemini") -> dict:
-        ind = self.get_indicators()
-        if not ind:
-            return {"signal": "NEUTRAL", "score": 0, "lstm": 0.5, "indicators": {}}
-        score = 0
-        rsi = ind["rsi"]
-        if rsi < 25: score += 3
-        elif rsi < 35: score += 2
-        elif rsi < 45: score += 1
-        elif rsi > 75: score -= 3
-        elif rsi > 65: score -= 2
-        elif rsi > 55: score -= 1
-        if ind["macd_hist"] > 0: score += 1
-        else: score -= 1
-        lstm = self.get_lstm_signal()
-        if lstm > 0.65: score += 2
-        elif lstm > 0.55: score += 1
-        elif lstm < 0.35: score -= 2
-        elif lstm < 0.45: score -= 1
-        if score >= 4: signal = "STRONG_BUY"
-        elif score >= 2: signal = "BUY"
-        elif score <= -4: signal = "STRONG_SELL"
-        elif score <= -2: signal = "SELL"
-        else: signal = "NEUTRAL"
-        return {"signal": signal, "score": score, "lstm": lstm, "indicators": ind}
+        return {"signal": signal, "score": score, "indicators": ind}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1068,10 +1033,8 @@ class GridBotV3:
 
         self.realized_pnl = 0.0
         self.trades_count = 0
-        self.closed_trades = []
         self.avg_buy_price = 0.0
         self.total_sol_bought = 0.0
-        self.total_sol_sold = 0.0
 
         self._thread = None
         self._tg_notify = None
@@ -1181,16 +1144,27 @@ class GridBotV3:
             log.error(f"Баланс SOL ошибка: {e}")
             return 0.0
 
-    @retry_api()
     def get_unrealized_pnl(self) -> float:
-        """Для спота: считаем unrealized PnL как разницу стоимости"""
-        try:
-            sol_bal = self.get_sol_balance()
-            if sol_bal > 0 and self.last_price > 0 and self.avg_buy_price > 0:
-                return (self.last_price - self.avg_buy_price) * sol_bal
-        except Exception:
-            pass
-        return 0.0
+        """Unrealized PnL: для фьючерсов берём upl из позиций, для спота считаем вручную"""
+        if "-SWAP" in CONFIG["symbol"]:
+            try:
+                r = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                if r.get("code") == "0":
+                    total_upl = 0.0
+                    for pos in r.get("data", []):
+                        total_upl += float(pos.get("upl", 0))
+                    return total_upl
+            except Exception:
+                pass
+            return 0.0
+        else:
+            try:
+                sol_bal = self.get_sol_balance()
+                if sol_bal > 0 and self.last_price > 0 and self.avg_buy_price > 0:
+                    return (self.last_price - self.avg_buy_price) * sol_bal
+            except Exception:
+                pass
+            return 0.0
 
     def get_spot_holdings(self) -> float:
         """Для спота возвращаем баланс SOL"""
@@ -1258,11 +1232,9 @@ class GridBotV3:
 
     def place_buy(self, price: float, qty: float = None, buy_price: float = None, pos_side: str = None) -> str | None:
         if self.get_open_order_count() >= MAX_ORDERS:
-            print(f"DEBUG: place_buy: MAX_ORDERS reached")
             return None
         if qty is None:
             qty = self._qty_for_price(price)
-        print(f"DEBUG place_buy: price={price}, qty={qty}, signal={self.last_signal.get('signal')}, pos_side={pos_side}")
         
         sig = self.last_signal.get("signal", "NEUTRAL")
         if sig == "STRONG_SELL":
@@ -1270,8 +1242,7 @@ class GridBotV3:
             return None
         if sig == "SELL":
             qty = round_qty(qty * 0.5)
-        if qty * price < 5.0:  # Minimum order value check
-            print(f"DEBUG: place_buy: qty * price = {qty * price} < 5, returning None")
+        if qty * price < 5.0:
             return None
         try:
             params = {
@@ -1323,8 +1294,6 @@ class GridBotV3:
             self._check_okx_response(r)
             oid = r["data"][0]["ordId"]
             self.active_orders[oid] = {"price": price, "type": "SELL", "qty": qty, "buy_price": buy_price, "pos_side": pos_side}
-            if pos_side != "short":
-                self.total_sol_sold += qty
             label = f"SELL (тейк лонг)" if pos_side == "long" else (f"SELL (вход в шорт)" if pos_side == "short" else "SELL")
             log.info(f"🔴 {label} @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
             return oid
@@ -1400,45 +1369,33 @@ class GridBotV3:
     # ── Сетка ─────────────────────────────────────────────────────
 
     def place_grid(self, price: float):
-        print(f"DEBUG: place_grid called with price={price}")
-        print(f"DEBUG: grid_levels={self.grid_levels}")
-        print(f"DEBUG: lower={self.lower}, upper={self.upper}")
-        
         self.cancel_all()
         time.sleep(0.5)
         
         # Лонг: BUY ордера ниже цены (вход в лонг)
         buy_levels = [p for p in self.grid_levels if p < price * 0.9995]
-        print(f"DEBUG: buy_levels={buy_levels}")
         
         placed = 0
         for lvl in sorted(buy_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
             qty = self._qty_for_price(lvl)
-            print(f"DEBUG: Trying BUY @ {lvl}, qty={qty}, val={qty*lvl:.2f}")
             result = self.place_buy(lvl, qty=qty, buy_price=lvl, pos_side="long")
-            print(f"DEBUG: place_buy returned: {result}")
             if result:
                 placed += 1
             time.sleep(0.05)
 
         # Шорт: SELL ордера ниже цены (вход в шорт)
         sell_levels = [p for p in self.grid_levels if p < price * 0.995]
-        print(f"DEBUG: sell_levels={sell_levels}")
         
         for lvl in sorted(sell_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
             qty = self._qty_for_price(lvl)
-            print(f"DEBUG: Trying SELL @ {lvl}, qty={qty}, val={qty*lvl:.2f}")
             result = self.place_sell(lvl, qty, buy_price=None, pos_side="short")
-            print(f"DEBUG: place_sell returned: {result}")
             if result:
                 placed += 1
             time.sleep(0.05)
-
-        print(f"DEBUG: placed={placed}")
         self.notify(f"📐 Сетка: {placed} ордера\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT")
 
     def _rebuild_grid_around_price(self, price: float):
@@ -1512,7 +1469,6 @@ class GridBotV3:
                             pnl = round((short_entry_price - price) * qty, 4)
                             self.realized_pnl += pnl
                             self.trades_count += 1
-                            self.closed_trades.append({"sell_price": short_entry_price, "buy_price": price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "short"})
                             log.info(f"🔒 Шорт закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.notify(f"🔒 Шорт: BUY @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.ensemble.record_outcome(pnl, pnl > 0)
@@ -1544,7 +1500,6 @@ class GridBotV3:
                         pnl = round((price - buy_price_entry) * qty, 4)
                         self.realized_pnl += pnl
                         self.trades_count += 1
-                        self.closed_trades.append({"sell_price": price, "buy_price": buy_price_entry, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "long"})
                         log.info(f"💰 Лонг закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.ensemble.record_outcome(pnl, pnl > 0)
@@ -1580,7 +1535,6 @@ class GridBotV3:
                             pnl = round((price - buy_price_entry) * qty, 4)
                             self.realized_pnl += pnl
                             self.trades_count += 1
-                            self.closed_trades.append({"sell_price": price, "buy_price": buy_price_entry, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "long"})
                             log.info(f"💰 Лонг закрыт (legacy) @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.ensemble.record_outcome(pnl, pnl > 0)
@@ -1665,7 +1619,7 @@ class GridBotV3:
         if sl_pct <= 0:
             return
         try:
-            r = self.trade_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+            r = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
             if r.get("code") != "0":
                 return
             positions = r.get("data", [])
@@ -1800,7 +1754,7 @@ class GridBotV3:
         """Синхронизация позиций - проверяет открытые позиции на бирже"""
         try:
             inst_type = "SWAP" if "-SWAP" in CONFIG["symbol"] else "SPOT"
-            r = self.trade_api.get_positions(instType=inst_type)
+            r = self.account_api.get_positions(instType=inst_type)
             if r.get("code") != "0":
                 return
             
@@ -2197,24 +2151,58 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(bot.status_text(), parse_mode="Markdown", reply_markup=main_keyboard())
 
     elif q.data == "balance":
-        unrealized = bot.get_unrealized_pnl()
         balance = bot.get_balance()
         avail = bot.get_available_balance()
-        sol_bal = bot.get_sol_balance()
-        holdings = bot.get_spot_holdings()
+        unrealized = bot.get_unrealized_pnl()
         price = bot.get_price()
-        await q.edit_message_text(
-            f"💰 *Баланс (спот)*\n\n"
-            f"💵 USDT: `{balance:.2f}`\n"
-            f"💳 Доступно USDT: `{avail:.2f}`\n"
-            f"🪙 SOL в кошельке: `{sol_bal:.2f}`\n"
-            f"📊 SOL в ордерах: `{holdings:.2f}`\n"
-            f"💲 Цена SOL: `{price:.2f} USDT`\n"
-            f"💎 Стоимость SOL: `{sol_bal * price:.2f} USDT`\n\n"
-            f"📈 Realized PnL: `{bot.realized_pnl:+.4f} USDT`\n"
-            f"📊 Avg buy: `{bot.avg_buy_price:.2f}`\n"
-            f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
-            parse_mode="Markdown", reply_markup=main_keyboard())
+        
+        if "-SWAP" in CONFIG["symbol"]:
+            # Фьючерсы — показываем позиции
+            try:
+                r = bot.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                positions_text = ""
+                if r.get("code") == "0":
+                    positions = r.get("data", [])
+                    if positions:
+                        for pos in positions:
+                            sz = float(pos.get("pos", 0))
+                            if sz > 0:
+                                ps = pos.get("posSide", "net")
+                                avg_px = float(pos.get("avgPx", 0))
+                                upl = float(pos.get("upl", 0))
+                                direction = "🟢 Лонг" if ps in ("long", "net") else "🔴 Шорт"
+                                positions_text += f"\n{direction}: `{sz}` @ `{avg_px:.2f}` | UPL: `{upl:+.4f}`"
+                    else:
+                        positions_text = "\nНет открытых позиций"
+            except Exception:
+                positions_text = "\nНе удалось загрузить позиции"
+            
+            await q.edit_message_text(
+                f"💰 *Баланс (фьючерсы)*\n\n"
+                f"💵 USDT: `{balance:.2f}`\n"
+                f"💳 Доступно: `{avail:.2f} USDT`\n"
+                f"💲 Цена: `{price:.2f}`\n"
+                f"📊 Позиции:{positions_text}\n\n"
+                f"📈 Realized PnL: `{bot.realized_pnl:+.4f} USDT`\n"
+                f"📊 Unrealized PnL: `{unrealized:+.4f} USDT`\n"
+                f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
+                parse_mode="Markdown", reply_markup=main_keyboard())
+        else:
+            # Спот
+            sol_bal = bot.get_sol_balance()
+            holdings = bot.get_spot_holdings()
+            await q.edit_message_text(
+                f"💰 *Баланс (спот)*\n\n"
+                f"💵 USDT: `{balance:.2f}`\n"
+                f"💳 Доступно USDT: `{avail:.2f}`\n"
+                f"🪙 SOL в кошельке: `{sol_bal:.2f}`\n"
+                f"📊 SOL в ордерах: `{holdings:.2f}`\n"
+                f"💲 Цена SOL: `{price:.2f} USDT`\n"
+                f"💎 Стоимость SOL: `{sol_bal * price:.2f} USDT`\n\n"
+                f"📈 Realized PnL: `{bot.realized_pnl:+.4f} USDT`\n"
+                f"📊 Avg buy: `{bot.avg_buy_price:.2f}`\n"
+                f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
+                parse_mode="Markdown", reply_markup=main_keyboard())
 
     elif q.data == "orders":
         buys = {k: v for k, v in bot.active_orders.items() if v["type"] == "BUY"}
@@ -2287,22 +2275,54 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "🧠 AI Сигнал":
         await update.message.reply_text(bot.ai_signal_text(), parse_mode="Markdown", reply_markup=persistent_keyboard())
     elif text == "💰 Баланс":
-        unrealized = bot.get_unrealized_pnl()
         balance = bot.get_balance()
         avail = bot.get_available_balance()
-        sol_bal = bot.get_sol_balance()
-        holdings = bot.get_spot_holdings()
+        unrealized = bot.get_unrealized_pnl()
         price = bot.get_price()
-        await update.message.reply_text(
-            f"💰 *Баланс (спот)*\n\n"
-            f"💵 USDT: `{balance:.2f}`\n"
-            f"💳 Доступно: `{avail:.2f} USDT`\n"
-            f"🪙 SOL в кошельке: `{sol_bal:.2f}`\n"
-            f"📊 SOL в ордерах: `{holdings:.2f}`\n"
-            f"💲 Цена: `{price:.2f}`\n"
-            f"💎 Стоимость SOL: `{sol_bal * price:.2f} USDT`\n"
-            f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
-            parse_mode="Markdown", reply_markup=persistent_keyboard())
+        
+        if "-SWAP" in CONFIG["symbol"]:
+            try:
+                r = bot.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                positions_text = ""
+                if r.get("code") == "0":
+                    positions = r.get("data", [])
+                    if positions:
+                        for pos in positions:
+                            sz = float(pos.get("pos", 0))
+                            if sz > 0:
+                                ps = pos.get("posSide", "net")
+                                avg_px = float(pos.get("avgPx", 0))
+                                upl = float(pos.get("upl", 0))
+                                direction = "🟢 Лонг" if ps in ("long", "net") else "🔴 Шорт"
+                                positions_text += f"\n{direction}: `{sz}` @ `{avg_px:.2f}` | UPL: `{upl:+.4f}`"
+                    else:
+                        positions_text = "\nНет открытых позиций"
+            except Exception:
+                positions_text = "\nНе удалось загрузить позиции"
+            
+            await update.message.reply_text(
+                f"💰 *Баланс (фьючерсы)*\n\n"
+                f"💵 USDT: `{balance:.2f}`\n"
+                f"💳 Доступно: `{avail:.2f} USDT`\n"
+                f"💲 Цена: `{price:.2f}`\n"
+                f"📊 Позиции:{positions_text}\n\n"
+                f"📈 Realized PnL: `{bot.realized_pnl:+.4f} USDT`\n"
+                f"📊 Unrealized PnL: `{unrealized:+.4f} USDT`\n"
+                f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
+                parse_mode="Markdown", reply_markup=persistent_keyboard())
+        else:
+            sol_bal = bot.get_sol_balance()
+            holdings = bot.get_spot_holdings()
+            await update.message.reply_text(
+                f"💰 *Баланс (спот)*\n\n"
+                f"💵 USDT: `{balance:.2f}`\n"
+                f"💳 Доступно: `{avail:.2f} USDT`\n"
+                f"🪙 SOL в кошельке: `{sol_bal:.2f}`\n"
+                f"📊 SOL в ордерах: `{holdings:.2f}`\n"
+                f"💲 Цена: `{price:.2f}`\n"
+                f"💎 Стоимость SOL: `{sol_bal * price:.2f} USDT`\n"
+                f"💎 *Итого PnL: `{bot.realized_pnl + unrealized:+.4f} USDT`*",
+                parse_mode="Markdown", reply_markup=persistent_keyboard())
     elif text == "📈 Backtest":
         report = bot.backtester.run_analysis(7)
         await update.message.reply_text(report, parse_mode="Markdown", reply_markup=persistent_keyboard())
