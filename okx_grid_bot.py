@@ -73,6 +73,11 @@ logging.basicConfig(
         ),
     ],
 )
+# Отключаем HTTP логи от библиотек
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("okx").setLevel(logging.WARNING)
+
 log = logging.getLogger("GridBotV3")
 
 
