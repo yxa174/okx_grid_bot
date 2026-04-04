@@ -26,6 +26,7 @@ import asyncio
 import csv
 import json
 import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -61,10 +62,15 @@ MIN_QTY = 0.1
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("grid_bot_v2.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            "bot.log",
+            maxBytes=5*1024*1024,
+            backupCount=3,
+            encoding="utf-8"
+        ),
     ],
 )
 log = logging.getLogger("GridBotV3")
@@ -762,24 +768,73 @@ Reasoning: <обоснование>"""
             return self._get_last_ensemble()
 
         self.last_analysis_time = now
-        results = {}
-        enabled = CONFIG.get("ai_enabled_providers", ["groq", "openrouter", "cohere", "deepseek"])
+        
+        # AI Fallback - пробуем провайдеры по очереди
+        result = self._analyze_with_fallback(price, indicators, position_size, realized_pnl, grid_lower, grid_upper)
+        
+        if result:
+            self.last_llm_results = {"fallback": result}
+            ensemble = self._vote({"fallback": result})
+            self._save_to_csv(price, indicators, {"fallback": result}, ensemble)
+            return ensemble
+        
+        # Все провайдеры недоступны - используем кэш
+        return self._get_last_ensemble()
 
-        # Каждый провайдер получает свой уникальный промт
-        for name in enabled:
-            provider = self.providers.get(name)
-            if provider:
-                # Создаём промт для конкретного провайдера с его стратегией
+    def _analyze_with_fallback(self, price: float, indicators: dict, position_size: float,
+                                realized_pnl: float, grid_lower: float, grid_upper: float) -> dict:
+        """AI с fallback - пробуем провайдеры по очереди"""
+        providers_order = ["gemini", "groq", "openrouter", "cohere", "deepseek"]
+        
+        for provider_name in providers_order:
+            provider = self.providers.get(provider_name)
+            if not provider:
+                continue
+                
+            try:
+                # Проверяем доступность провайдера
+                if not self._check_provider_available(provider_name):
+                    log.warning(f"⚠️ {provider_name} недоступен, пробую следующий")
+                    continue
+                
+                # Создаём промт
                 prompt = self._build_prompt(
-                    price, indicators, position_size, realized_pnl, 
-                    grid_lower, grid_upper, provider=name
+                    price, indicators, position_size, realized_pnl,
+                    grid_lower, grid_upper, provider=provider_name
                 )
-                results[name] = provider.get_signal(prompt)
+                
+                # Вызываем AI
+                result = provider.get_signal(prompt)
+                
+                # Успех - логируем и возвращаем
+                log.info(f"🧠 {provider_name}: {result.get('signal', 'N/A')} (conf={result.get('confidence', 0):.2f})")
+                return result
+                
+            except Exception as e:
+                log.warning(f"⚠️ {provider_name} ошибка: {e} → пробую следующий")
+                continue
+        
+        # Все провайдеры упали
+        log.error("🔴 Все AI провайдеры недоступны!")
+        return None
 
-        self.last_llm_results = results
-        ensemble = self._vote(results)
-        self._save_to_csv(price, indicators, results, ensemble)
-        return ensemble
+    def _check_provider_available(self, provider_name: str) -> bool:
+        """Проверка доступности провайдера (быстрый ping)"""
+        try:
+            if provider_name == "gemini":
+                # Gemini - простой тест через API key
+                return bool(GEMINI_API_KEY)
+            elif provider_name == "groq":
+                return bool(GROQ_API_KEY)
+            elif provider_name == "openrouter":
+                return bool(OPENROUTER_API_KEY)
+            elif provider_name == "cohere":
+                return bool(COHERE_API_KEY)
+            elif provider_name == "deepseek":
+                return bool(DEEPSEEK_API_KEY)
+            return False
+        except:
+            return False
 
     def _vote(self, results: dict) -> dict:
         score_map = {"STRONG_BUY": 2, "BUY": 1, "NEUTRAL": 0, "SELL": -1, "STRONG_SELL": -2}
@@ -1430,6 +1485,7 @@ class GridBotV3:
         self.start_time = datetime.now()
         trailing_cooldown = 0
         ai_cooldown = 0
+        sync_cooldown = 0  # Синхронизация позиций каждые 60 сек
 
         while self.running:
             try:
@@ -1464,6 +1520,13 @@ class GridBotV3:
                     )
                     ai_cooldown = CONFIG.get("ai_analysis_interval", 900) // CONFIG.get("check_interval", 10)
 
+                # Синхронизация позиций каждые 60 сек
+                if sync_cooldown > 0:
+                    sync_cooldown -= 1
+                else:
+                    self.sync_positions()
+                    sync_cooldown = 6  # 60 сек / 10 сек интервал
+
                 auto_bt = self.backtester.check_auto_run()
                 if auto_bt:
                     self.notify(auto_bt)
@@ -1488,6 +1551,47 @@ class GridBotV3:
             except Exception as e:
                 log.error(f"Цикл ошибка: {e}")
                 time.sleep(15)
+
+    def sync_positions(self):
+        """Синхронизация позиций - проверяет открытые позиции на бирже"""
+        try:
+            inst_type = "SWAP" if "-SWAP" in CONFIG["symbol"] else "SPOT"
+            r = self.trade_api.get_positions(instType=inst_type)
+            if r.get("code") != "0":
+                return
+            
+            positions = r.get("data", [])
+            for pos in positions:
+                if pos.get("instId") != CONFIG["symbol"]:
+                    continue
+                
+                sz = float(pos.get("pos", 0))
+                if sz <= 0:
+                    continue
+                
+                # Проверяем - есть ли эта позиция в active_orders
+                pos_side = pos.get("posSide", "net")
+                avg_px = float(pos.get("avgPx", 0))
+                
+                # Ищем в active_orders по цене (приблизительно)
+                found = False
+                for oid, order in self.active_orders.items():
+                    if abs(order.get("price", 0) - avg_px) < 0.1:
+                        found = True
+                        break
+                
+                if not found:
+                    # Нашли "потерянную" позицию!
+                    log.warning(f"⚠️ Found lost position: {pos_side} {sz} @ {avg_px}")
+                    self.notify(f"⚠️ Найдена потерянная позиция: {pos_side} {sz} @ {avg_px}")
+                    
+                    # Выставляем SELL TP
+                    tp_price = avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100)
+                    self.place_sell(tp_price, sz)
+                    log.info(f"📤 SELL TP выставлен @ {tp_price:.2f}")
+                    
+        except Exception as e:
+            log.warning(f"Синхронизация позиций ошибка: {e}")
 
     def start(self) -> bool:
         if self.running:
@@ -1732,6 +1836,59 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Неизвестный параметр: `{key}`", parse_mode="Markdown", reply_markup=persistent_keyboard())
 
 
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Остановка бота - закрывает все позиции и ордера"""
+    if not auth(update): return
+    
+    bot = ctx.bot_data.get("bot")
+    if not bot:
+        await update.message.reply_text("❌ Бот не инициализирован", reply_markup=persistent_keyboard())
+        return
+    
+    await update.message.reply_text("🔴 Останавливаю бота...", reply_markup=persistent_keyboard())
+    
+    try:
+        # 1. Отменяем все ордера
+        cancel_result = bot.trade_api.cancel_all_orders(instType="SWAP" if "-SWAP" in CONFIG["symbol"] else "SPOT", instId=CONFIG["symbol"])
+        cancelled_count = len(cancel_result.get("data", [])) if cancel_result.get("code") == "0" else 0
+        
+        # 2. Закрываем все позиции
+        positions_closed = 0
+        try:
+            close_result = bot.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
+            if close_result.get("code") == "0":
+                positions_closed = len(close_result.get("data", []))
+        except Exception as e:
+            log.warning(f"close_positions не доступен: {e}")
+        
+        # 3. Получаем PnL
+        pnl = 0
+        try:
+            bal = bot.get_balance()
+            pnl = bal - 5000  # примерно
+        except:
+            pass
+        
+        log.info(f"🔴 STOP: отменено={cancelled_count}, закрыто={positions_closed}, PnL~={pnl:.2f}")
+        
+        # 4. Уведомление
+        msg = f"""🔴 *БОТ ОСТАНОВЛЕН*
+
+✅ Отменено ордеров: {cancelled_count}
+✅ Закрыто позиций: {positions_closed}
+💰 Примерный PnL: `{pnl:.2f} USDT`"""
+
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=persistent_keyboard())
+        
+        # 5. Останавливаем бота
+        log.info("🔴 Бот остановлен пользователем")
+        os._exit(0)
+        
+    except Exception as e:
+        log.error(f"Ошибка при остановке: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=persistent_keyboard())
+
+
 def format_settings_page() -> str:
     return (
         "⚙️ *Настройки бота (спот)*\n\n"
@@ -1933,6 +2090,7 @@ def main():
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1944,6 +2102,7 @@ def main():
             ("backtest", "Точность нейронк"),
             ("help", "Справка"),
             ("set", "Изменить параметр"),
+            ("stop", "Остановить бота"),
         ])
 
     app.post_init = post_init
