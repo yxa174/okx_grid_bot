@@ -1112,8 +1112,22 @@ class GridBotV3:
     def setup_account(self):
         if "-SWAP" in CONFIG["symbol"]:
             log.info("⚡ Фьючерсный режим (с плечом)")
+            # Пробуем переключить в long/short mode (нужно чтобы posSide работал)
+            # Это НЕ сработает если есть открытые позиции — тогда работаем в net mode
+            self.use_pos_side = False
+            try:
+                r = self.account_api.set_position_mode("long_short_mode")
+                if r.get("code") == "0":
+                    log.info("✅ Позиционный режим: long/short mode (posSide включён)")
+                    self.use_pos_side = True
+                else:
+                    msg = r.get("msg", r.get("code"))
+                    log.warning(f"⚠️ set_position_mode: {msg} — работаю в net mode (без posSide)")
+            except Exception as e:
+                log.warning(f"⚠️ Не удалось установить long/short mode: {e} — работаю в net mode (без posSide)")
         else:
             log.info("✅ Спотовый режим (без плеча)")
+            self.use_pos_side = False
 
     @retry_api()
     def get_price(self) -> float:
@@ -1268,7 +1282,7 @@ class GridBotV3:
                 "sz": str(qty),
                 "px": str(price)
             }
-            if pos_side and "-SWAP" in CONFIG["symbol"]:
+            if pos_side and "-SWAP" in CONFIG["symbol"] and getattr(self, 'use_pos_side', False):
                 params["posSide"] = pos_side
             r = self.trade_api.place_order(**params)
             log.info(f"📤 BUY response: {r}")
@@ -1303,7 +1317,7 @@ class GridBotV3:
                 "sz": str(qty),
                 "px": str(price)
             }
-            if pos_side and "-SWAP" in CONFIG["symbol"]:
+            if pos_side and "-SWAP" in CONFIG["symbol"] and getattr(self, 'use_pos_side', False):
                 params["posSide"] = pos_side
             r = self.trade_api.place_order(**params)
             self._check_okx_response(r)
@@ -1325,27 +1339,37 @@ class GridBotV3:
         """Закрытие всех позиций на фьючерсах через close_positions API"""
         try:
             if "-SWAP" in CONFIG["symbol"]:
-                # Закрываем лонг позиции
-                try:
-                    r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
-                    if r.get("code") == "0":
-                        log.info("🔒 Лонг позиции закрыты")
-                    else:
-                        log.info(f"Закрытие лонгов: {r.get('msg', r.get('code'))}")
-                except Exception as e:
-                    if "No positions" not in str(e) and "position" not in str(e).lower():
-                        log.error(f"Закрытие лонгов ошибка: {e}")
-                
-                # Закрываем шорт позиции
-                try:
-                    r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
-                    if r.get("code") == "0":
-                        log.info("🔒 Шорт позиции закрыты")
-                    else:
-                        log.info(f"Закрытие шортов: {r.get('msg', r.get('code'))}")
-                except Exception as e:
-                    if "No positions" not in str(e) and "position" not in str(e).lower():
-                        log.error(f"Закрытие шортов ошибка: {e}")
+                if getattr(self, 'use_pos_side', False):
+                    # Long/short mode — закрываем по сторонам
+                    try:
+                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                        if r.get("code") == "0":
+                            log.info("🔒 Лонг позиции закрыты")
+                        else:
+                            log.info(f"Закрытие лонгов: {r.get('msg', r.get('code'))}")
+                    except Exception as e:
+                        if "No positions" not in str(e) and "position" not in str(e).lower():
+                            log.error(f"Закрытие лонгов ошибка: {e}")
+                    try:
+                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                        if r.get("code") == "0":
+                            log.info("🔒 Шорт позиции закрыты")
+                        else:
+                            log.info(f"Закрытие шортов: {r.get('msg', r.get('code'))}")
+                    except Exception as e:
+                        if "No positions" not in str(e) and "position" not in str(e).lower():
+                            log.error(f"Закрытие шортов ошибка: {e}")
+                else:
+                    # Net mode — закрываем без posSide
+                    try:
+                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
+                        if r.get("code") == "0":
+                            log.info("🔒 Все позиции закрыты (net mode)")
+                        else:
+                            log.info(f"Закрытие позиций: {r.get('msg', r.get('code'))}")
+                    except Exception as e:
+                        if "No positions" not in str(e) and "position" not in str(e).lower():
+                            log.error(f"Закрытие позиций ошибка: {e}")
             else:
                 # Спот режим
                 sol_holdings = self.get_spot_holdings()
@@ -1653,25 +1677,31 @@ class GridBotV3:
                     continue
                 pos_side = pos.get("posSide", "net")
                 avg_px = float(pos.get("avgPx", 0))
-                upl = float(pos.get("upl", 0))  # Unrealized PnL
                 
-                # Определяем направление убытка
-                if pos_side == "long":
-                    # Лонг теряет если цена упала
+                # Определяем направление: в net mode posSide="net", направление по стороне позиции
+                is_long = (pos_side == "long") or (pos_side == "net" and sz > 0)
+                is_short = (pos_side == "short") or (pos_side == "net" and sz < 0)
+                
+                if is_long:
                     sl_price = avg_px * (1 - sl_pct)
                     current_price = self.get_price()
                     if current_price <= sl_price:
                         log.warning(f"🛑 STOP LOSS лонг @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
                         self.notify(f"🛑 STOP LOSS лонг! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
-                        self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
-                elif pos_side == "short":
-                    # Шорт теряет если цена выросла
+                        if getattr(self, 'use_pos_side', False):
+                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                        else:
+                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
+                elif is_short:
                     sl_price = avg_px * (1 + sl_pct)
                     current_price = self.get_price()
                     if current_price >= sl_price:
                         log.warning(f"🛑 STOP LOSS шорт @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
                         self.notify(f"🛑 STOP LOSS шорт! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
-                        self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                        if getattr(self, 'use_pos_side', False):
+                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                        else:
+                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
         except Exception as e:
             log.error(f"check_per_order_stop_loss ошибка: {e}")
 
