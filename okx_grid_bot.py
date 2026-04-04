@@ -1030,6 +1030,7 @@ class GridBotV3:
         self.grid_levels = []
         self.active_orders = {}
         self._cancelled_ids = set()
+        self._synced_positions = {}  # {f"{posSide}_{avg_px:.2f}": True} — уже обработанные позиции
 
         self.realized_pnl = 0.0
         self.trades_count = 0
@@ -1759,6 +1760,8 @@ class GridBotV3:
                 return
             
             positions = r.get("data", [])
+            current_keys = set()
+            
             for pos in positions:
                 if pos.get("instId") != CONFIG["symbol"]:
                     continue
@@ -1769,6 +1772,12 @@ class GridBotV3:
                 
                 pos_side_api = pos.get("posSide", "net")
                 avg_px = float(pos.get("avgPx", 0))
+                pos_key = f"{pos_side_api}_{avg_px:.2f}"
+                current_keys.add(pos_key)
+                
+                # Уже обрабатывали эту позицию?
+                if pos_key in self._synced_positions:
+                    continue
                 
                 # Ищем в active_orders по цене (приблизительно)
                 found = False
@@ -1783,15 +1792,22 @@ class GridBotV3:
                     self.notify(f"⚠️ Найдена потерянная позиция: {pos_side_api} {sz} @ {avg_px}")
                     
                     if pos_side_api == "long":
-                        # Лонг позиция - ставим SELL TP для закрытия
                         tp_price = avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100)
-                        self.place_sell(tp_price, sz, buy_price=avg_px, pos_side="long")
-                        log.info(f"📤 SELL TP (лонг) выставлен @ {tp_price:.2f}")
+                        oid = self.place_sell(tp_price, sz, buy_price=avg_px, pos_side="long")
+                        if oid:
+                            self._synced_positions[pos_key] = True
+                            log.info(f"📤 SELL TP (лонг) выставлен @ {tp_price:.2f}")
                     elif pos_side_api == "short":
-                        # Шорт позиция - ставим BUY TP для закрытия
                         tp_price = avg_px * (1 - CONFIG.get("take_profit_pct", 0.5) / 100)
-                        self.place_buy(tp_price, qty=sz, buy_price=avg_px, pos_side="short")
-                        log.info(f"📥 BUY TP (шорт) выставлен @ {tp_price:.2f}")
+                        oid = self.place_buy(tp_price, qty=sz, buy_price=avg_px, pos_side="short")
+                        if oid:
+                            self._synced_positions[pos_key] = True
+                            log.info(f"📥 BUY TP (шорт) выставлен @ {tp_price:.2f}")
+            
+            # Удаляем из _synced_positions те, которых больше нет (позиция закрылась)
+            for key in list(self._synced_positions):
+                if key not in current_keys:
+                    del self._synced_positions[key]
                     
         except Exception as e:
             log.warning(f"Синхронизация позиций ошибка: {e}")
