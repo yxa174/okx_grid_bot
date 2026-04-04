@@ -30,7 +30,7 @@ CONFIG: dict = {
     "symbol":           "SOL-USDT-SWAP",  # Futures trading
 
     # ── Сетка ─────────────────────────────────────────────────────
-    "grid_levels":      20,
+    "grid_levels":      80,
     "atr_multiplier":   2.5,
     "max_range_pct":    0.20,
 
