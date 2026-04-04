@@ -1083,6 +1083,7 @@ class GridBotV3:
         self.backtester = Backtester(self.ensemble)
         self.last_signal = {"signal": "NEUTRAL", "score": 0, "confidence": 0.5, "providers": {}, "indicators": {}}
         self.pending_sells = []  # [(price, qty), ...] — ждут появления SOL
+        self.positions_without_tp = []  # Позиции открытые но без TP ордера
 
     def set_tg_notify(self, fn):
         self._tg_notify = fn
@@ -1241,41 +1242,52 @@ class GridBotV3:
         qty = max(qty, MIN_QTY)
         return round_qty(qty)
 
-    def place_buy(self, price: float) -> str | None:
+    def place_buy(self, price: float, qty: float = None, buy_price: float = None, pos_side: str = None) -> str | None:
         if self.get_open_order_count() >= MAX_ORDERS:
+            print(f"DEBUG: place_buy: MAX_ORDERS reached")
             return None
+        if qty is None:
+            qty = self._qty_for_price(price)
+        print(f"DEBUG place_buy: price={price}, qty={qty}, signal={self.last_signal.get('signal')}, pos_side={pos_side}")
+        
         sig = self.last_signal.get("signal", "NEUTRAL")
         if sig == "STRONG_SELL":
             log.info(f"🧠 AI STRONG_SELL — пропуск BUY@{price}")
             return None
-        qty = self._qty_for_price(price)
         if sig == "SELL":
             qty = round_qty(qty * 0.5)
         if qty * price < 5.0:  # Minimum order value check
+            print(f"DEBUG: place_buy: qty * price = {qty * price} < 5, returning None")
             return None
         try:
-            r = self.trade_api.place_order(
-                instId=CONFIG["symbol"],
-                tdMode="isolated",
-                side="buy",
-                ordType="limit",
-                sz=str(qty),
-                px=str(price)
-            )
+            params = {
+                "instId": CONFIG["symbol"],
+                "tdMode": "isolated",
+                "side": "buy",
+                "ordType": "limit",
+                "sz": str(qty),
+                "px": str(price)
+            }
+            if pos_side and "-SWAP" in CONFIG["symbol"]:
+                params["posSide"] = pos_side
+            r = self.trade_api.place_order(**params)
             log.info(f"📤 BUY response: {r}")
             self._check_okx_response(r)
             oid = r["data"][0]["ordId"]
-            self.active_orders[oid] = {"price": price, "type": "BUY", "qty": qty, "buy_price": price}
-            self.total_sol_bought += qty
-            if self.total_sol_bought > 0:
-                self.avg_buy_price = ((self.avg_buy_price * (self.total_sol_bought - qty)) + (price * qty)) / self.total_sol_bought
-            log.info(f"🟢 BUY @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
+            # buy_price = цена входа в позицию (для расчёта PnL)
+            self.active_orders[oid] = {"price": price, "type": "BUY", "qty": qty, "buy_price": buy_price, "pos_side": pos_side}
+            if pos_side != "short":
+                self.total_sol_bought += qty
+                if self.total_sol_bought > 0:
+                    self.avg_buy_price = ((self.avg_buy_price * (self.total_sol_bought - qty)) + (price * qty)) / self.total_sol_bought
+            label = f"BUY (лонг)" if pos_side == "long" else (f"BUY (закрытие шорта)" if pos_side == "short" else "BUY")
+            log.info(f"🟢 {label} @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
             return oid
         except Exception as e:
             log.error(f"BUY ошибка: {e}")
             return None
 
-    def place_sell(self, price: float, qty: float, buy_price: float = None) -> str | None:
+    def place_sell(self, price: float, qty: float, buy_price: float = None, pos_side: str = None) -> str | None:
         if self.get_open_order_count() >= MAX_ORDERS:
             return None
         qty = round_qty(qty)
@@ -1283,19 +1295,24 @@ class GridBotV3:
             log.warning(f"⚠️ Пропуск SELL: qty={qty} * price={price} = {qty*price} < 5 USDT")
             return None
         try:
-            r = self.trade_api.place_order(
-                instId=CONFIG["symbol"],
-                tdMode="isolated",
-                side="sell",
-                ordType="limit",
-                sz=str(qty),
-                px=str(price)
-            )
+            params = {
+                "instId": CONFIG["symbol"],
+                "tdMode": "isolated",
+                "side": "sell",
+                "ordType": "limit",
+                "sz": str(qty),
+                "px": str(price)
+            }
+            if pos_side and "-SWAP" in CONFIG["symbol"]:
+                params["posSide"] = pos_side
+            r = self.trade_api.place_order(**params)
             self._check_okx_response(r)
             oid = r["data"][0]["ordId"]
-            self.active_orders[oid] = {"price": price, "type": "SELL", "qty": qty, "buy_price": buy_price}
-            self.total_sol_sold += qty
-            log.info(f"🔴 SELL @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
+            self.active_orders[oid] = {"price": price, "type": "SELL", "qty": qty, "buy_price": buy_price, "pos_side": pos_side}
+            if pos_side != "short":
+                self.total_sol_sold += qty
+            label = f"SELL (тейк лонг)" if pos_side == "long" else (f"SELL (вход в шорт)" if pos_side == "short" else "SELL")
+            log.info(f"🔴 {label} @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
             return oid
         except Exception as e:
             if "Insufficient margin" in str(e) or "margin" in str(e).lower():
@@ -1305,22 +1322,46 @@ class GridBotV3:
             return None
 
     def close_all_positions(self):
-        """На споте: продаём все имеющиеся SOL по рынку"""
-        sol_holdings = self.get_spot_holdings()
-        if sol_holdings <= 0:
-            return
+        """Закрытие всех позиций на фьючерсах через close_positions API"""
         try:
-            r = self.trade_api.place_order(
-                instId=CONFIG["symbol"],
-                tdMode="isolated",
-                side="sell",
-                ordType="market",
-                sz=str(round_qty(sol_holdings)),
-            )
-            self._check_okx_response(r)
-            log.info(f"🔒 Продано {sol_holdings} SOL по рынку")
+            if "-SWAP" in CONFIG["symbol"]:
+                # Закрываем лонг позиции
+                try:
+                    r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                    if r.get("code") == "0":
+                        log.info("🔒 Лонг позиции закрыты")
+                    else:
+                        log.info(f"Закрытие лонгов: {r.get('msg', r.get('code'))}")
+                except Exception as e:
+                    if "No positions" not in str(e) and "position" not in str(e).lower():
+                        log.error(f"Закрытие лонгов ошибка: {e}")
+                
+                # Закрываем шорт позиции
+                try:
+                    r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                    if r.get("code") == "0":
+                        log.info("🔒 Шорт позиции закрыты")
+                    else:
+                        log.info(f"Закрытие шортов: {r.get('msg', r.get('code'))}")
+                except Exception as e:
+                    if "No positions" not in str(e) and "position" not in str(e).lower():
+                        log.error(f"Закрытие шортов ошибка: {e}")
+            else:
+                # Спот режим
+                sol_holdings = self.get_spot_holdings()
+                if sol_holdings <= 0:
+                    return
+                r = self.trade_api.place_order(
+                    instId=CONFIG["symbol"],
+                    tdMode="cash",
+                    side="sell",
+                    ordType="market",
+                    sz=str(round_qty(sol_holdings)),
+                )
+                self._check_okx_response(r)
+                log.info(f"🔒 Продано {sol_holdings} SOL по рынку")
         except Exception as e:
-            log.error(f"Закрытие ошибка: {e}")
+            log.error(f"Закрытие позиций ошибка: {e}")
 
     def cancel_all(self):
         try:
@@ -1335,61 +1376,86 @@ class GridBotV3:
     # ── Сетка ─────────────────────────────────────────────────────
 
     def place_grid(self, price: float):
+        print(f"DEBUG: place_grid called with price={price}")
+        print(f"DEBUG: grid_levels={self.grid_levels}")
+        print(f"DEBUG: lower={self.lower}, upper={self.upper}")
+        
         self.cancel_all()
         time.sleep(0.5)
+        
+        # Лонг: BUY ордера ниже цены (вход в лонг)
         buy_levels = [p for p in self.grid_levels if p < price * 0.9995]
+        print(f"DEBUG: buy_levels={buy_levels}")
+        
         placed = 0
         for lvl in sorted(buy_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
-            if self.place_buy(lvl):
+            qty = self._qty_for_price(lvl)
+            print(f"DEBUG: Trying BUY @ {lvl}, qty={qty}, val={qty*lvl:.2f}")
+            result = self.place_buy(lvl, qty=qty, buy_price=lvl, pos_side="long")
+            print(f"DEBUG: place_buy returned: {result}")
+            if result:
                 placed += 1
             time.sleep(0.05)
 
-        sol_holdings = self.get_spot_holdings()
-        if sol_holdings > 0:
-            sell_levels = [p for p in self.grid_levels if p > price * 1.0005]
-            sell_placed = 0
-            qty_per = round_qty(sol_holdings / max(len(sell_levels), 1))
-            for lvl in sorted(sell_levels):
-                if self.get_open_order_count() >= MAX_ORDERS:
-                    break
-                if self.place_sell(lvl, qty_per):
-                    sell_placed += 1
-                time.sleep(0.05)
-            self.notify(f"📐 Сетка: {placed} BUY, {sell_placed} SELL\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT\nПозиция: {sol_holdings:.1f} SOL")
-        else:
-            self.notify(f"📐 Сетка: {placed} BUY\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT")
+        # Шорт: SELL ордера ниже цены (вход в шорт)
+        sell_levels = [p for p in self.grid_levels if p < price * 0.995]
+        print(f"DEBUG: sell_levels={sell_levels}")
+        
+        for lvl in sorted(sell_levels, reverse=True):
+            if self.get_open_order_count() >= MAX_ORDERS:
+                break
+            qty = self._qty_for_price(lvl)
+            print(f"DEBUG: Trying SELL @ {lvl}, qty={qty}, val={qty*lvl:.2f}")
+            result = self.place_sell(lvl, qty, buy_price=None, pos_side="short")
+            print(f"DEBUG: place_sell returned: {result}")
+            if result:
+                placed += 1
+            time.sleep(0.05)
+
+        print(f"DEBUG: placed={placed}")
+        self.notify(f"📐 Сетка: {placed} ордера\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT")
 
     def _rebuild_grid_around_price(self, price: float):
         self.lower, self.upper = self.calc_atr_range(price)
         self.grid_levels = self.build_grid(self.lower, self.upper)
         to_cancel = [oid for oid, o in self.active_orders.items()
-                     if o["type"] == "BUY" and (o["price"] < self.lower or o["price"] > self.upper)]
+                     if o["type"] in ("BUY", "SELL") and (o["price"] < self.lower or o["price"] > self.upper)]
         for oid in to_cancel:
             try:
                 self.trade_api.cancel_order(instId=CONFIG["symbol"], ordId=oid)
                 self.active_orders.pop(oid, None)
             except Exception:
                 pass
-        existing = {o["price"] for o in self.active_orders.values() if o["type"] == "BUY"}
-        buy_levels = [p for p in self.grid_levels if p < price * 0.9995 and p not in existing]
+        existing_buy = {o["price"] for o in self.active_orders.values() if o["type"] == "BUY" and o.get("pos_side") == "long"}
+        existing_sell = {o["price"] for o in self.active_orders.values() if o["type"] == "SELL" and o.get("pos_side") == "short"}
+        buy_levels = [p for p in self.grid_levels if p < price * 0.9995 and p not in existing_buy]
+        sell_levels = [p for p in self.grid_levels if p < price * 0.995 and p not in existing_sell]
         placed = 0
         for lvl in sorted(buy_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
-            if self.place_buy(lvl):
+            qty = self._qty_for_price(lvl)
+            if self.place_buy(lvl, qty=qty, buy_price=lvl, pos_side="long"):
+                placed += 1
+            time.sleep(0.05)
+        for lvl in sorted(sell_levels, reverse=True):
+            if self.get_open_order_count() >= MAX_ORDERS:
+                break
+            qty = self._qty_for_price(lvl)
+            if self.place_sell(lvl, qty, buy_price=None, pos_side="short"):
                 placed += 1
             time.sleep(0.05)
         return placed
 
     def trailing_up(self, price: float):
         placed = self._rebuild_grid_around_price(price)
-        self.notify(f"📈 Trailing UP: {placed} новых BUY\nДиапазон: {self.lower:.2f} — {self.upper:.2f}")
+        self.notify(f"📈 Trailing UP: {placed} новых ордеров\nДиапазон: {self.lower:.2f} — {self.upper:.2f}")
 
     def trailing_down(self, price: float):
         placed = self._rebuild_grid_around_price(price)
-        self.notify(f"📉 Trailing DOWN: {placed} новых BUY\nДиапазон: {self.lower:.2f} — {self.upper:.2f}")
+        self.notify(f"📉 Trailing DOWN: {placed} новых ордеров\nДиапазон: {self.lower:.2f} — {self.upper:.2f}")
 
     # ── Исполненные ───────────────────────────────────────────────
 
@@ -1410,50 +1476,98 @@ class GridBotV3:
                 self._cancelled_ids.discard(oid)
                 continue
             price, otype, qty = order["price"], order["type"], order["qty"]
+            buy_price_entry = order.get("buy_price")
+            pos_side = order.get("pos_side")
+            
             if otype == "BUY":
-                # Для фьючерсов - сразу выставляем SELL с TP
                 if "-SWAP" in CONFIG["symbol"]:
-                    tp_pct = CONFIG.get("take_profit_pct", 0.5) / 100
-                    sell_price = round_price(price * (1 + tp_pct))
-                    log.info(f"📤 SELL TP @ {sell_price:.2f} (+{tp_pct*100:.1f}%)")
-                    self.place_sell(sell_price, qty, buy_price=price)
-                else:
-                    # Для спота - старая логика
-                    sell_price = round_price(price + step)
-                    self.trades_count += 1
-                    self.notify(f"✅ BUY @ {price:.2f} → SELL {sell_price:.2f} | qty={qty}")
-                    if sell_price <= self.upper:
-                        self.pending_sells.append((sell_price, qty))
+                    if pos_side == "short":
+                        # Это BUY для закрытия шорта - считаем PnL
+                        short_entry_price = buy_price_entry
+                        if short_entry_price is not None:
+                            pnl = round((short_entry_price - price) * qty, 4)
+                            self.realized_pnl += pnl
+                            self.trades_count += 1
+                            self.closed_trades.append({"sell_price": short_entry_price, "buy_price": price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "short"})
+                            log.info(f"🔒 Шорт закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                            self.notify(f"🔒 Шорт: BUY @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                            self.ensemble.record_outcome(pnl, pnl > 0)
+                            
+                            # Ставим новый SELL на уровень выше (вход в новый шорт)
+                            new_sell_price = round_price(price + step * 2)
+                            if new_sell_price <= self.upper:
+                                time.sleep(0.2)
+                                oid_new = self.place_sell(new_sell_price, qty, buy_price=None, pos_side="short")
+                                if not oid_new:
+                                    log.warning(f"⚠️ Не удалось поставить SELL для нового шорта @ {new_sell_price}, добавляю в retry")
+                                    self.positions_without_tp.append({"type": "SELL", "price": new_sell_price, "qty": qty, "buy_price": None, "pos_side": "short", "retries": 0})
+                        else:
+                            log.warning(f"⚠️ Шорт закрыт @ {price:.2f}, но нет цены входа")
+                    else:
+                        # Это BUY для входа в лонг - ставим SELL TP
+                        tp_pct = CONFIG.get("take_profit_pct", 0.5) / 100
+                        sell_price = round_price(price * (1 + tp_pct))
+                        log.info(f"📤 SELL TP (лонг) @ {sell_price:.2f} (+{tp_pct*100:.1f}%)")
+                        oid_tp = self.place_sell(sell_price, qty, buy_price=price, pos_side="long")
+                        if not oid_tp:
+                            log.warning(f"⚠️ Не удалось поставить SELL TP @ {sell_price}, добавляю в retry")
+                            self.positions_without_tp.append({"type": "SELL", "price": sell_price, "qty": qty, "buy_price": price, "pos_side": "long", "retries": 0})
+                        
             elif otype == "SELL":
-                # Для фьючерсов - после SELL сразу ставим новый BUY
                 if "-SWAP" in CONFIG["symbol"]:
-                    # Рассчитываем PnL
-                    buy_price = order.get("buy_price", price)
-                    pnl = round((price - buy_price) * qty, 4)
-                    self.realized_pnl += pnl
-                    self.trades_count += 1
-                    self.closed_trades.append({"sell_price": price, "buy_price": buy_price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat()})
-                    log.info(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
-                    self.notify(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
-                    self.ensemble.record_outcome(pnl, pnl > 0)
-                    
-                    # Ставим новый BUY на уровень ниже
-                    new_buy_price = round_price(price - step * 2)
-                    if new_buy_price >= self.lower:
-                        time.sleep(0.2)
-                        self.place_buy(new_buy_price)
-                else:
-                    # Для спота - старая логика
-                    buy_price = round_price(price - step)
-                    pnl = round(step * qty, 4)
-                    self.realized_pnl += pnl
-                    self.trades_count += 1
-                    self.closed_trades.append({"sell_price": price, "buy_price": buy_price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat()})
-                    self.notify(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
-                    self.ensemble.record_outcome(pnl, pnl > 0)
-                    if buy_price >= self.lower:
-                        time.sleep(0.2)
-                        self.place_buy(buy_price)
+                    if pos_side == "long":
+                        # Это SELL TP для лонга (buy_price = цена входа в лонг)
+                        pnl = round((price - buy_price_entry) * qty, 4)
+                        self.realized_pnl += pnl
+                        self.trades_count += 1
+                        self.closed_trades.append({"sell_price": price, "buy_price": buy_price_entry, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "long"})
+                        log.info(f"💰 Лонг закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                        self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                        self.ensemble.record_outcome(pnl, pnl > 0)
+                        
+                        # Ставим новый BUY на уровень ниже
+                        new_buy_price = round_price(price - step * 2)
+                        if new_buy_price >= self.lower:
+                            time.sleep(0.2)
+                            oid_new = self.place_buy(new_buy_price, pos_side="long")
+                            if not oid_new:
+                                log.warning(f"⚠️ Не удалось поставить BUY @ {new_buy_price}, добавляю в retry")
+                                self.positions_without_tp.append({"type": "BUY", "price": new_buy_price, "qty": qty, "buy_price": new_buy_price, "pos_side": "long", "retries": 0})
+                    elif pos_side == "short":
+                        # Это SELL как вход в ШОРТ - ставим BUY TP (закрытие шорта)
+                        tp_pct = CONFIG.get("take_profit_pct", 0.5) / 100
+                        buy_tp_price = round_price(price * (1 - tp_pct))
+                        log.info(f"📥 BUY TP (шорт) @ {buy_tp_price:.2f} (+{tp_pct*100:.1f}%)")
+                        oid_tp = self.place_buy(buy_tp_price, qty, buy_price=price, pos_side="short")
+                        if not oid_tp:
+                            log.warning(f"⚠️ Не удалось поставить BUY TP @ {buy_tp_price}, добавляю в retry")
+                            self.positions_without_tp.append({"type": "BUY", "price": buy_tp_price, "qty": qty, "buy_price": price, "pos_side": "short", "retries": 0})
+                    else:
+                        # pos_side не указан - старый режим: если buy_price=None, это вход в шорт
+                        if buy_price_entry is None:
+                            tp_pct = CONFIG.get("take_profit_pct", 0.5) / 100
+                            buy_tp_price = round_price(price * (1 - tp_pct))
+                            log.info(f"📥 BUY TP (шорт, legacy) @ {buy_tp_price:.2f} (+{tp_pct*100:.1f}%)")
+                            oid_tp = self.place_buy(buy_tp_price, qty, buy_price=price, pos_side="short")
+                            if not oid_tp:
+                                log.warning(f"⚠️ Не удалось поставить BUY TP @ {buy_tp_price}, добавляю в retry")
+                                self.positions_without_tp.append({"type": "BUY", "price": buy_tp_price, "qty": qty, "buy_price": price, "pos_side": "short", "retries": 0})
+                        else:
+                            pnl = round((price - buy_price_entry) * qty, 4)
+                            self.realized_pnl += pnl
+                            self.trades_count += 1
+                            self.closed_trades.append({"sell_price": price, "buy_price": buy_price_entry, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat(), "direction": "long"})
+                            log.info(f"💰 Лонг закрыт (legacy) @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                            self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
+                            self.ensemble.record_outcome(pnl, pnl > 0)
+                            
+                            new_buy_price = round_price(price - step * 2)
+                            if new_buy_price >= self.lower:
+                                time.sleep(0.2)
+                                oid_new = self.place_buy(new_buy_price, pos_side="long")
+                                if not oid_new:
+                                    log.warning(f"⚠️ Не удалось поставить BUY @ {new_buy_price}, добавляю в retry")
+                                    self.positions_without_tp.append({"type": "BUY", "price": new_buy_price, "qty": qty, "buy_price": new_buy_price, "pos_side": "long", "retries": 0})
 
     def place_pending_sells(self):
         """Пытается разместить отложенные SELL ордера когда SOL появился"""
@@ -1476,6 +1590,30 @@ class GridBotV3:
         if placed_any:
             log.info(f"📋 Размещено SELL, осталось в очереди: {len(self.pending_sells)}")
 
+    def retry_missing_tp_orders(self):
+        """Повторно пытается поставить TP ордера для позиций без защиты"""
+        if not self.positions_without_tp:
+            return
+        still_missing = []
+        for item in self.positions_without_tp:
+            if item["retries"] >= 5:
+                log.error(f"❌ Не удалось поставить ордер после 5 попыток: {item}")
+                self.notify(f"❌ ОШИБКА! Позиция без TP после 5 попыток: {item['type']} @ {item['price']:.2f}")
+                continue
+            oid = None
+            if item["type"] == "BUY":
+                oid = self.place_buy(item["price"], qty=item["qty"], buy_price=item["buy_price"], pos_side=item["pos_side"])
+            elif item["type"] == "SELL":
+                oid = self.place_sell(item["price"], qty=item["qty"], buy_price=item["buy_price"], pos_side=item["pos_side"])
+            if oid:
+                log.info(f"✅ TP ордер успешно поставлен после {item['retries']+1} попытки: {item['type']} @ {item['price']:.2f}")
+            else:
+                item["retries"] += 1
+                still_missing.append(item)
+        self.positions_without_tp = still_missing
+        if still_missing:
+            log.warning(f"⚠️ {len(still_missing)} TP ордеров всё ещё не выставлены")
+
     # ── Защиты ────────────────────────────────────────────────────
 
     def check_global_stops(self) -> bool:
@@ -1494,6 +1632,48 @@ class GridBotV3:
             self.notify(f"⚠️ Баланс {balance:.2f} < {min_bal}")
             return True
         return False
+
+    def check_per_order_stop_loss(self):
+        """Проверяет stop loss для каждой открытой позиции"""
+        if "-SWAP" not in CONFIG["symbol"]:
+            return
+        sl_pct = CONFIG.get("stop_loss_pct", 1.0) / 100
+        if sl_pct <= 0:
+            return
+        try:
+            r = self.trade_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+            if r.get("code") != "0":
+                return
+            positions = r.get("data", [])
+            for pos in positions:
+                if pos.get("instId") != CONFIG["symbol"]:
+                    continue
+                sz = float(pos.get("pos", 0))
+                if sz <= 0:
+                    continue
+                pos_side = pos.get("posSide", "net")
+                avg_px = float(pos.get("avgPx", 0))
+                upl = float(pos.get("upl", 0))  # Unrealized PnL
+                
+                # Определяем направление убытка
+                if pos_side == "long":
+                    # Лонг теряет если цена упала
+                    sl_price = avg_px * (1 - sl_pct)
+                    current_price = self.get_price()
+                    if current_price <= sl_price:
+                        log.warning(f"🛑 STOP LOSS лонг @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
+                        self.notify(f"🛑 STOP LOSS лонг! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
+                        self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                elif pos_side == "short":
+                    # Шорт теряет если цена выросла
+                    sl_price = avg_px * (1 + sl_pct)
+                    current_price = self.get_price()
+                    if current_price >= sl_price:
+                        log.warning(f"🛑 STOP LOSS шорт @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
+                        self.notify(f"🛑 STOP LOSS шорт! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
+                        self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+        except Exception as e:
+            log.error(f"check_per_order_stop_loss ошибка: {e}")
 
     # ── Основной цикл ─────────────────────────────────────────────
 
@@ -1540,6 +1720,8 @@ class GridBotV3:
                     break
 
                 self.check_filled()
+                self.check_per_order_stop_loss()
+                self.retry_missing_tp_orders()
                 self.place_pending_sells()
 
                 if ai_cooldown > 0:
@@ -1601,26 +1783,31 @@ class GridBotV3:
                 if sz <= 0:
                     continue
                 
-                # Проверяем - есть ли эта позиция в active_orders
-                pos_side = pos.get("posSide", "net")
+                pos_side_api = pos.get("posSide", "net")
                 avg_px = float(pos.get("avgPx", 0))
                 
                 # Ищем в active_orders по цене (приблизительно)
                 found = False
                 for oid, order in self.active_orders.items():
-                    if abs(order.get("price", 0) - avg_px) < 0.1:
+                    if abs(order.get("price", 0) - avg_px) < 0.5:
                         found = True
                         break
                 
                 if not found:
                     # Нашли "потерянную" позицию!
-                    log.warning(f"⚠️ Found lost position: {pos_side} {sz} @ {avg_px}")
-                    self.notify(f"⚠️ Найдена потерянная позиция: {pos_side} {sz} @ {avg_px}")
+                    log.warning(f"⚠️ Found lost position: {pos_side_api} {sz} @ {avg_px}")
+                    self.notify(f"⚠️ Найдена потерянная позиция: {pos_side_api} {sz} @ {avg_px}")
                     
-                    # Выставляем SELL TP
-                    tp_price = avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100)
-                    self.place_sell(tp_price, sz)
-                    log.info(f"📤 SELL TP выставлен @ {tp_price:.2f}")
+                    if pos_side_api == "long":
+                        # Лонг позиция - ставим SELL TP для закрытия
+                        tp_price = avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100)
+                        self.place_sell(tp_price, sz, buy_price=avg_px, pos_side="long")
+                        log.info(f"📤 SELL TP (лонг) выставлен @ {tp_price:.2f}")
+                    elif pos_side_api == "short":
+                        # Шорт позиция - ставим BUY TP для закрытия
+                        tp_price = avg_px * (1 - CONFIG.get("take_profit_pct", 0.5) / 100)
+                        self.place_buy(tp_price, qty=sz, buy_price=avg_px, pos_side="short")
+                        log.info(f"📥 BUY TP (шорт) выставлен @ {tp_price:.2f}")
                     
         except Exception as e:
             log.warning(f"Синхронизация позиций ошибка: {e}")

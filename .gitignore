@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 train_lstm.py
 grid_bot_v2.log
+venv
