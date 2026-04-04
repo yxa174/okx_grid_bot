@@ -1265,7 +1265,7 @@ class GridBotV3:
             log.info(f"📤 BUY response: {r}")
             self._check_okx_response(r)
             oid = r["data"][0]["ordId"]
-            self.active_orders[oid] = {"price": price, "type": "BUY", "qty": qty}
+            self.active_orders[oid] = {"price": price, "type": "BUY", "qty": qty, "buy_price": price}
             self.total_sol_bought += qty
             if self.total_sol_bought > 0:
                 self.avg_buy_price = ((self.avg_buy_price * (self.total_sol_bought - qty)) + (price * qty)) / self.total_sol_bought
@@ -1275,12 +1275,12 @@ class GridBotV3:
             log.error(f"BUY ошибка: {e}")
             return None
 
-    def place_sell(self, price: float, qty: float) -> str | None:
+    def place_sell(self, price: float, qty: float, buy_price: float = None) -> str | None:
         if self.get_open_order_count() >= MAX_ORDERS:
             return None
         qty = round_qty(qty)
         if qty * price < 5.0:
-            log.warning(f"⚠️ Пропуск BUY: qty={qty} * price={price} = {qty*price} < 5 USDT")
+            log.warning(f"⚠️ Пропуск SELL: qty={qty} * price={price} = {qty*price} < 5 USDT")
             return None
         try:
             r = self.trade_api.place_order(
@@ -1293,7 +1293,7 @@ class GridBotV3:
             )
             self._check_okx_response(r)
             oid = r["data"][0]["ordId"]
-            self.active_orders[oid] = {"price": price, "type": "SELL", "qty": qty}
+            self.active_orders[oid] = {"price": price, "type": "SELL", "qty": qty, "buy_price": buy_price}
             self.total_sol_sold += qty
             log.info(f"🔴 SELL @ {price} qty={qty} (x{CONFIG.get('leverage', 5.0)} leverage)")
             return oid
@@ -1411,22 +1411,49 @@ class GridBotV3:
                 continue
             price, otype, qty = order["price"], order["type"], order["qty"]
             if otype == "BUY":
-                sell_price = round_price(price + step)
-                self.trades_count += 1
-                self.notify(f"✅ BUY @ {price:.2f} → SELL {sell_price:.2f} | qty={qty}")
-                if sell_price <= self.upper:
-                    self.pending_sells.append((sell_price, qty))
+                # Для фьючерсов - сразу выставляем SELL с TP
+                if "-SWAP" in CONFIG["symbol"]:
+                    tp_pct = CONFIG.get("take_profit_pct", 0.5) / 100
+                    sell_price = round_price(price * (1 + tp_pct))
+                    log.info(f"📤 SELL TP @ {sell_price:.2f} (+{tp_pct*100:.1f}%)")
+                    self.place_sell(sell_price, qty, buy_price=price)
+                else:
+                    # Для спота - старая логика
+                    sell_price = round_price(price + step)
+                    self.trades_count += 1
+                    self.notify(f"✅ BUY @ {price:.2f} → SELL {sell_price:.2f} | qty={qty}")
+                    if sell_price <= self.upper:
+                        self.pending_sells.append((sell_price, qty))
             elif otype == "SELL":
-                buy_price = round_price(price - step)
-                pnl = round(step * qty, 4)
-                self.realized_pnl += pnl
-                self.trades_count += 1
-                self.closed_trades.append({"sell_price": price, "buy_price": buy_price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat()})
-                self.notify(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
-                self.ensemble.record_outcome(pnl, pnl > 0)
-                if buy_price >= self.lower:
-                    time.sleep(0.2)
-                    self.place_buy(buy_price)
+                # Для фьючерсов - после SELL сразу ставим новый BUY
+                if "-SWAP" in CONFIG["symbol"]:
+                    # Рассчитываем PnL
+                    buy_price = order.get("buy_price", price)
+                    pnl = round((price - buy_price) * qty, 4)
+                    self.realized_pnl += pnl
+                    self.trades_count += 1
+                    self.closed_trades.append({"sell_price": price, "buy_price": buy_price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat()})
+                    log.info(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
+                    self.notify(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
+                    self.ensemble.record_outcome(pnl, pnl > 0)
+                    
+                    # Ставим новый BUY на уровень ниже
+                    new_buy_price = round_price(price - step * 2)
+                    if new_buy_price >= self.lower:
+                        time.sleep(0.2)
+                        self.place_buy(new_buy_price)
+                else:
+                    # Для спота - старая логика
+                    buy_price = round_price(price - step)
+                    pnl = round(step * qty, 4)
+                    self.realized_pnl += pnl
+                    self.trades_count += 1
+                    self.closed_trades.append({"sell_price": price, "buy_price": buy_price, "qty": qty, "pnl": pnl, "ts": datetime.now().isoformat()})
+                    self.notify(f"💰 SELL @ {price:.2f} | PnL: +{pnl:.4f} | Итого: {self.realized_pnl:+.4f}")
+                    self.ensemble.record_outcome(pnl, pnl > 0)
+                    if buy_price >= self.lower:
+                        time.sleep(0.2)
+                        self.place_buy(buy_price)
 
     def place_pending_sells(self):
         """Пытается разместить отложенные SELL ордера когда SOL появился"""
