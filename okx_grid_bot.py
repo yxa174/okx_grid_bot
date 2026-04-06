@@ -1086,9 +1086,38 @@ class GridBotV3:
                     self.use_pos_side = True
                 else:
                     msg = r.get("msg", r.get("code"))
-                    log.warning(f"⚠️ set_position_mode: {msg} — работаю в net mode (без posSide)")
+                    log.warning(f"⚠️ set_position_mode: {msg} — определяю режим по позициям")
+                    # Проверяем, в каком режиме уже находятся позиции
+                    try:
+                        pr = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                        if pr.get("code") == "0":
+                            positions = pr.get("data", [])
+                            for pos in positions:
+                                ps = pos.get("posSide", "net")
+                                if ps in ("long", "short"):
+                                    self.use_pos_side = True
+                                    log.info(f"✅ Обнаружен long/short mode по позиции {ps}")
+                                    break
+                    except Exception:
+                        pass
+                    if not self.use_pos_side:
+                        log.warning("⚠️ Работаю в net mode (без posSide)")
             except Exception as e:
-                log.warning(f"⚠️ Не удалось установить long/short mode: {e} — работаю в net mode (без posSide)")
+                log.warning(f"⚠️ Не удалось установить long/short mode: {e} — определяю режим по позициям")
+                try:
+                    pr = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                    if pr.get("code") == "0":
+                        positions = pr.get("data", [])
+                        for pos in positions:
+                            ps = pos.get("posSide", "net")
+                            if ps in ("long", "short"):
+                                self.use_pos_side = True
+                                log.info(f"✅ Обнаружен long/short mode по позиции {ps}")
+                                break
+                except Exception:
+                    pass
+                if not self.use_pos_side:
+                    log.warning("⚠️ Работаю в net mode (без posSide)")
         else:
             log.info("✅ Спотовый режим (без плеча)")
             self.use_pos_side = False
