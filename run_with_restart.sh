@@ -5,8 +5,7 @@ RESTART_COUNT=0
 
 while true; do
     echo "[$(date)] Запуск бота (попытка $((RESTART_COUNT+1)))"
-    cd /Users/a123/Documents/code/okx_bot_test
-    ./venv/bin/python okx_grid_bot.py 2>&1 | tee -a bot.log
+    python okx_grid_bot.py 
     
     EXIT_CODE=$?
     RESTART_COUNT=$((RESTART_COUNT+1))

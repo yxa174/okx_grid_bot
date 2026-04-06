@@ -656,7 +656,7 @@ class AIEnsemble:
                       provider: str = None) -> str:
         """Создаёт промт для AI с учётом стратегии провайдера"""
         ctx = self.market.get_market_context(price)
-        
+
         # Получаем стратегию для провайдера
         strategies = CONFIG.get("ai_strategies", {})
         if provider and provider in strategies:
@@ -672,7 +672,7 @@ class AIEnsemble:
             risk = CONFIG.get("ai_risk", "умеренный")
             instruction = ""
             min_conf = 0.6
-        
+
         memory_text = ""
         if self.memory:
             recent = list(self.memory)[-5:]
@@ -727,7 +727,7 @@ MA20: {indicators.get('ma20', '—')} | MA50: {indicators.get('ma50', '—')}
 Signal: <сигнал>
 Confidence: <0.0-1.0>
 Reasoning: <обоснование>"""
-        
+
         return prompt
 
     def analyze(self, price: float, indicators: dict, position_size: float,
@@ -738,16 +738,16 @@ Reasoning: <обоснование>"""
             return self._get_last_ensemble()
 
         self.last_analysis_time = now
-        
+
         # AI Fallback - пробуем провайдеры по очереди
         result = self._analyze_with_fallback(price, indicators, position_size, realized_pnl, grid_lower, grid_upper)
-        
+
         if result:
             self.last_llm_results = {"fallback": result}
             ensemble = self._vote({"fallback": result})
             self._save_to_csv(price, indicators, {"fallback": result}, ensemble)
             return ensemble
-        
+
         # Все провайдеры недоступны - используем кэш
         return self._get_last_ensemble()
 
@@ -755,35 +755,35 @@ Reasoning: <обоснование>"""
                                 realized_pnl: float, grid_lower: float, grid_upper: float) -> dict:
         """AI с fallback - пробуем провайдеры по очереди"""
         providers_order = ["gemini", "groq", "openrouter", "cohere", "deepseek"]
-        
+
         for provider_name in providers_order:
             provider = self.providers.get(provider_name)
             if not provider:
                 continue
-                
+
             try:
                 # Проверяем доступность провайдера
                 if not self._check_provider_available(provider_name):
                     log.warning(f"⚠️ {provider_name} недоступен, пробую следующий")
                     continue
-                
+
                 # Создаём промт
                 prompt = self._build_prompt(
                     price, indicators, position_size, realized_pnl,
                     grid_lower, grid_upper, provider=provider_name
                 )
-                
+
                 # Вызываем AI
                 result = provider.get_signal(prompt)
-                
+
                 # Успех - логируем и возвращаем
                 log.info(f"🧠 {provider_name}: {result.get('signal', 'N/A')} (conf={result.get('confidence', 0):.2f})")
                 return result
-                
+
             except Exception as e:
                 log.warning(f"⚠️ {provider_name} ошибка: {e} → пробую следующий")
                 continue
-        
+
         # Все провайдеры упали
         log.error("🔴 Все AI провайдеры недоступны!")
         return None
@@ -1265,7 +1265,7 @@ class GridBotV3:
             return None
         if qty is None:
             qty = self._qty_for_price(price)
-        
+
         sig = self.last_signal.get("signal", "NEUTRAL")
         if sig == "STRONG_SELL":
             log.info(f"🧠 AI STRONG_SELL — пропуск BUY@{price}")
@@ -1401,10 +1401,10 @@ class GridBotV3:
     def place_grid(self, price: float):
         self.cancel_all()
         time.sleep(0.5)
-        
+
         # Лонг: BUY ордера ниже цены (вход в лонг)
         buy_levels = [p for p in self.grid_levels if p < price * 0.9995]
-        
+
         placed = 0
         for lvl in sorted(buy_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
@@ -1417,7 +1417,7 @@ class GridBotV3:
 
         # Шорт: SELL ордера ниже цены (вход в шорт)
         sell_levels = [p for p in self.grid_levels if p < price * 0.995]
-        
+
         for lvl in sorted(sell_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
@@ -1489,7 +1489,7 @@ class GridBotV3:
             price, otype, qty = order["price"], order["type"], order["qty"]
             buy_price_entry = order.get("buy_price")
             pos_side = order.get("pos_side")
-            
+
             if otype == "BUY":
                 if "-SWAP" in CONFIG["symbol"]:
                     if pos_side == "short":
@@ -1502,7 +1502,7 @@ class GridBotV3:
                             log.info(f"🔒 Шорт закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.notify(f"🔒 Шорт: BUY @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.ensemble.record_outcome(pnl, pnl > 0)
-                            
+
                             # Ставим новый SELL на уровень выше (вход в новый шорт)
                             new_sell_price = round_price(price + step * 2)
                             if new_sell_price <= self.upper:
@@ -1522,7 +1522,7 @@ class GridBotV3:
                         if not oid_tp:
                             log.warning(f"⚠️ Не удалось поставить SELL TP @ {sell_price}, добавляю в retry")
                             self.positions_without_tp.append({"type": "SELL", "price": sell_price, "qty": qty, "buy_price": price, "pos_side": "long", "retries": 0})
-                        
+
             elif otype == "SELL":
                 if "-SWAP" in CONFIG["symbol"]:
                     if pos_side == "long":
@@ -1533,7 +1533,7 @@ class GridBotV3:
                         log.info(f"💰 Лонг закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.ensemble.record_outcome(pnl, pnl > 0)
-                        
+
                         # Ставим новый BUY на уровень ниже
                         new_buy_price = round_price(price - step * 2)
                         if new_buy_price >= self.lower:
@@ -1568,7 +1568,7 @@ class GridBotV3:
                             log.info(f"💰 Лонг закрыт (legacy) @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.ensemble.record_outcome(pnl, pnl > 0)
-                            
+
                             new_buy_price = round_price(price - step * 2)
                             if new_buy_price >= self.lower:
                                 time.sleep(0.2)
@@ -1661,11 +1661,11 @@ class GridBotV3:
                     continue
                 pos_side = pos.get("posSide", "net")
                 avg_px = float(pos.get("avgPx", 0))
-                
+
                 # Определяем направление: в net mode posSide="net", направление по стороне позиции
                 is_long = (pos_side == "long") or (pos_side == "net" and sz > 0)
                 is_short = (pos_side == "short") or (pos_side == "net" and sz < 0)
-                
+
                 if is_long:
                     sl_price = avg_px * (1 - sl_pct)
                     current_price = self.get_price()
@@ -1787,39 +1787,39 @@ class GridBotV3:
             r = self.account_api.get_positions(instType=inst_type)
             if r.get("code") != "0":
                 return
-            
+
             positions = r.get("data", [])
             current_keys = set()
-            
+
             for pos in positions:
                 if pos.get("instId") != CONFIG["symbol"]:
                     continue
-                
+
                 sz = float(pos.get("pos", 0))
                 if sz <= 0:
                     continue
-                
+
                 pos_side_api = pos.get("posSide", "net")
                 avg_px = float(pos.get("avgPx", 0))
                 pos_key = f"{pos_side_api}_{avg_px:.2f}"
                 current_keys.add(pos_key)
-                
+
                 # Уже обрабатывали эту позицию?
                 if pos_key in self._synced_positions:
                     continue
-                
+
                 # Ищем в active_orders по цене (приблизительно)
                 found = False
                 for oid, order in self.active_orders.items():
                     if abs(order.get("price", 0) - avg_px) < 0.5:
                         found = True
                         break
-                
+
                 if not found:
                     # Нашли "потерянную" позицию!
                     log.warning(f"⚠️ Found lost position: {pos_side_api} {sz} @ {avg_px}")
                     self.notify(f"⚠️ Найдена потерянная позиция: {pos_side_api} {sz} @ {avg_px}")
-                    
+
                     if pos_side_api == "long":
                         tp_price = avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100)
                         oid = self.place_sell(tp_price, sz, buy_price=avg_px, pos_side="long")
@@ -1832,12 +1832,12 @@ class GridBotV3:
                         if oid:
                             self._synced_positions[pos_key] = True
                             log.info(f"📥 BUY TP (шорт) выставлен @ {tp_price:.2f}")
-            
+
             # Удаляем из _synced_positions те, которых больше нет (позиция закрылась)
             for key in list(self._synced_positions):
                 if key not in current_keys:
                     del self._synced_positions[key]
-                    
+
         except Exception as e:
             log.warning(f"Синхронизация позиций ошибка: {e}")
 
@@ -2087,19 +2087,19 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Остановка бота - закрывает все позиции и ордера"""
     if not auth(update): return
-    
+
     bot = ctx.bot_data.get("bot")
     if not bot:
         await update.message.reply_text("❌ Бот не инициализирован", reply_markup=persistent_keyboard())
         return
-    
+
     await update.message.reply_text("🔴 Останавливаю бота...", reply_markup=persistent_keyboard())
-    
+
     try:
         # 1. Отменяем все ордера
         cancel_result = bot.trade_api.cancel_all_orders(instType="SWAP" if "-SWAP" in CONFIG["symbol"] else "SPOT", instId=CONFIG["symbol"])
         cancelled_count = len(cancel_result.get("data", [])) if cancel_result.get("code") == "0" else 0
-        
+
         # 2. Закрываем все позиции
         positions_closed = 0
         try:
@@ -2108,7 +2108,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 positions_closed = len(close_result.get("data", []))
         except Exception as e:
             log.warning(f"close_positions не доступен: {e}")
-        
+
         # 3. Получаем PnL
         pnl = 0
         try:
@@ -2116,9 +2116,9 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pnl = bal - 5000  # примерно
         except:
             pass
-        
+
         log.info(f"🔴 STOP: отменено={cancelled_count}, закрыто={positions_closed}, PnL~={pnl:.2f}")
-        
+
         # 4. Уведомление
         msg = f"""🔴 *БОТ ОСТАНОВЛЕН*
 
@@ -2127,11 +2127,11 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 💰 Примерный PnL: `{pnl:.2f} USDT`"""
 
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=persistent_keyboard())
-        
+
         # 5. Останавливаем бота
         log.info("🔴 Бот остановлен пользователем")
         os._exit(0)
-        
+
     except Exception as e:
         log.error(f"Ошибка при остановке: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=persistent_keyboard())
@@ -2200,7 +2200,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         avail = bot.get_available_balance()
         unrealized = bot.get_unrealized_pnl()
         price = bot.get_price()
-        
+
         if "-SWAP" in CONFIG["symbol"]:
             # Фьючерсы — показываем позиции
             try:
@@ -2221,7 +2221,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         positions_text = "\nНет открытых позиций"
             except Exception:
                 positions_text = "\nНе удалось загрузить позиции"
-            
+
             await q.edit_message_text(
                 f"💰 *Баланс (фьючерсы)*\n\n"
                 f"💵 USDT: `{balance:.2f}`\n"
@@ -2324,7 +2324,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         avail = bot.get_available_balance()
         unrealized = bot.get_unrealized_pnl()
         price = bot.get_price()
-        
+
         if "-SWAP" in CONFIG["symbol"]:
             try:
                 r = bot.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
@@ -2344,7 +2344,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         positions_text = "\nНет открытых позиций"
             except Exception:
                 positions_text = "\nНе удалось загрузить позиции"
-            
+
             await update.message.reply_text(
                 f"💰 *Баланс (фьючерсы)*\n\n"
                 f"💵 USDT: `{balance:.2f}`\n"
@@ -2426,7 +2426,6 @@ def main():
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
     log.info("=" * 55)
 
-<<<<<<< HEAD
     # Запускаем polling с обработкой конфликтов и авто-перезапуском
     while True:
         try:
@@ -2453,20 +2452,6 @@ def main():
 
 
 if __name__ == "__main__":
-    MAX_RESTARTS = 5
-    restart_count = 0
-    
-    while True:
-        try:
-            main()
-            break  # Корректная остановка
-        except KeyboardInterrupt:
-            log.info("🛑 Остановка по Ctrl+C")
-=======
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
-
-if __name__ == "__main__":
     MAX_RESTARTS = 10
     restart_count = 0
 
@@ -2481,7 +2466,6 @@ if __name__ == "__main__":
                 bot.stop()
             except Exception:
                 pass
->>>>>>> 9473521 (Убрал instType=SWAP из всех 7 вызовов close_positions. Это была единственная ошибка, которая вызывала падение бота при срабатывании стоп-лосса.)
             break
         except Exception as e:
             restart_count += 1
@@ -2492,15 +2476,9 @@ if __name__ == "__main__":
             wait_time = min(30 * restart_count, 120)
             log.info(f"🔄 Перезапуск через {wait_time} сек...")
             time.sleep(wait_time)
-<<<<<<< HEAD
-            # Пересоздаём бота
-            try:
-                bot.stop()
-=======
             # Сбрасываем состояние бота
             try:
                 bot.running = False
->>>>>>> 9473521 (Убрал instType=SWAP из всех 7 вызовов close_positions. Это была единственная ошибка, которая вызывала падение бота при срабатывании стоп-лосса.)
             except Exception:
                 pass
             bot = GridBotV3()
