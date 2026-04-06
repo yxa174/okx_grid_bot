@@ -64,7 +64,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
             "bot.log",
             maxBytes=5*1024*1024,
@@ -79,6 +78,85 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("okx").setLevel(logging.WARNING)
 
 log = logging.getLogger("GridBotV3")
+
+
+class StatusTracker:
+    """Отслеживает ошибки и статус для отображения в консоли"""
+    def __init__(self):
+        self.critical_errors = 0    # Ошибки закрытия позиций, SL
+        self.warnings = 0           # Предупреждения API, rate limits
+        self.trades_count = 0       # Количество сделок
+        self.total_pnl = 0.0        # Общий PnL
+        self.open_positions = 0     # Открытые позиции
+        self.open_orders = 0        # Открытые ордера
+        self.balance = 0.0          # Баланс
+        self.price = 0.0            # Текущая цена
+        self.grid_range = ""        # Диапазон сетки
+        self.last_update = ""       # Последнее важное событие
+        self.start_time = time.time()
+        self.running = False
+        self._lines_rendered = 0    # Сколько строк было выведено
+
+    def add_critical(self, msg: str):
+        self.critical_errors += 1
+        self.last_update = f"❌ {msg}"
+
+    def add_warning(self, msg: str):
+        self.warnings += 1
+        self.last_update = f"⚠️ {msg}"
+
+    def add_trade(self, pnl: float):
+        self.trades_count += 1
+        self.total_pnl += pnl
+        sign = "+" if pnl >= 0 else ""
+        self.last_update = f"💰 {sign}{pnl:.2f} USDT"
+
+    def render(self) -> str:
+        total_time = time.time() - self.start_time
+        days = int(total_time / 86400)
+        hours = int((total_time % 86400) / 3600)
+        mins = int((total_time % 3600) / 60)
+        secs = int(total_time % 60)
+        if days > 0:
+            uptime = f"{days}д {hours:02d}:{mins:02d}:{secs:02d}"
+        else:
+            uptime = f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+        status_icon = "🟢" if self.running else "🔴"
+        pnl_color = "🟢" if self.total_pnl >= 0 else "🔴"
+        sign = "+" if self.total_pnl >= 0 else ""
+
+        lines = [
+            f"{'='*52}",
+            f"  {status_icon} GRID BOT V3 — OKX Testnet",
+            f"  ⏱ Аптайм:  {uptime}   🔄 Циклов: {self.trades_count + self.open_orders}",
+            f"{'─'*52}",
+            f"  💵 Баланс:   {self.balance:>10.2f} USDT  |  📊 Цена: {self.price:.2f}",
+            f"  📐 Сетка:    {self.grid_range:>20s}",
+            f"  📈 Позиции:  {self.open_positions:>5d}  |  📋 Ордера: {self.open_orders}",
+            f"  {pnl_color} PnL:       {sign}{self.total_pnl:>9.2f} USDT  |  💰 Сделок: {self.trades_count}",
+            f"  ❌ Ошибки:  {self.critical_errors:>5d}  |  ⚠️ Warn: {self.warnings}",
+            f"{'─'*52}",
+            f"  📝 {self.last_update if self.last_update else 'Ожидание...'}",
+            f"{'='*52}",
+        ]
+        self._lines_rendered = len(lines)
+        return "\n".join(lines)
+
+
+status = StatusTracker()
+
+
+def render_status():
+    """Отрисовывает статус в консоли — затирает предыдущий"""
+    import sys
+    output = status.render()
+    # Поднимаем курсор на _lines_rendered строк вверх
+    if status._lines_rendered > 0:
+        sys.stdout.write(f"\033[{status._lines_rendered}A")
+    sys.stdout.write("\033[J")  # Очищаем от курсора до конца экрана
+    sys.stdout.write(output + "\n")
+    sys.stdout.flush()
 
 
 def retry_api(retries=3, delay=2):
@@ -1499,6 +1577,7 @@ class GridBotV3:
                             pnl = round((short_entry_price - price) * qty, 4)
                             self.realized_pnl += pnl
                             self.trades_count += 1
+                            status.add_trade(pnl)
                             log.info(f"🔒 Шорт закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.notify(f"🔒 Шорт: BUY @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                             self.ensemble.record_outcome(pnl, pnl > 0)
@@ -1530,6 +1609,7 @@ class GridBotV3:
                         pnl = round((price - buy_price_entry) * qty, 4)
                         self.realized_pnl += pnl
                         self.trades_count += 1
+                        status.add_trade(pnl)
                         log.info(f"💰 Лонг закрыт @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.notify(f"💰 Лонг: SELL @ {price:.2f} | PnL: {pnl:+.4f} | Итого: {self.realized_pnl:+.4f}")
                         self.ensemble.record_outcome(pnl, pnl > 0)
@@ -1671,21 +1751,79 @@ class GridBotV3:
                     current_price = self.get_price()
                     if current_price <= sl_price:
                         log.warning(f"🛑 STOP LOSS лонг @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
+                        status.add_critical(f"SL лонг @ {avg_px:.2f}")
                         self.notify(f"🛑 STOP LOSS лонг! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
-                        if getattr(self, 'use_pos_side', False):
-                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
-                        else:
-                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
+                        try:
+                            if getattr(self, 'use_pos_side', False):
+                                r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                            else:
+                                r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
+                            log.info(f"📤 close_positions ответ: {r}")
+                            if r.get("code") == "0":
+                                log.info(f"✅ Позиция лонг закрыта по SL")
+                            else:
+                                log.error(f"❌ Ошибка закрытия лонга: code={r.get('code')}, msg={r.get('msg')}, full={r}")
+                                self.notify(f"❌ Ошибка закрытия SL: {r}")
+                                # Fallback: закрываем market ордером
+                                try:
+                                    sz = abs(sz)
+                                    r2 = self.trade_api.place_order(
+                                        instId=CONFIG["symbol"],
+                                        tdMode="isolated",
+                                        side="sell",
+                                        ordType="market",
+                                        sz=str(sz),
+                                        posSide="long" if getattr(self, 'use_pos_side', False) else None,
+                                    )
+                                    log.info(f"📤 Fallback market close ответ: {r2}")
+                                    if r2.get("code") == "0":
+                                        log.info(f"✅ Позиция лонг закрыта market ордером")
+                                    else:
+                                        log.error(f"❌ Fallback market close ошибка: {r2}")
+                                except Exception as e2:
+                                    log.error(f"❌ Fallback market close ошибка: {e2}")
+                        except Exception as e:
+                            log.error(f"❌ Ошибка close_positions (лонг): {e}")
+                            self.notify(f"❌ Ошибка закрытия SL: {e}")
                 elif is_short:
                     sl_price = avg_px * (1 + sl_pct)
                     current_price = self.get_price()
                     if current_price >= sl_price:
                         log.warning(f"🛑 STOP LOSS шорт @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
+                        status.add_critical(f"SL шорт @ {avg_px:.2f}")
                         self.notify(f"🛑 STOP LOSS шорт! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
-                        if getattr(self, 'use_pos_side', False):
-                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
-                        else:
-                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
+                        try:
+                            if getattr(self, 'use_pos_side', False):
+                                r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                            else:
+                                r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
+                            log.info(f"📤 close_positions ответ: {r}")
+                            if r.get("code") == "0":
+                                log.info(f"✅ Позиция шорт закрыта по SL")
+                            else:
+                                log.error(f"❌ Ошибка закрытия шорта: code={r.get('code')}, msg={r.get('msg')}, full={r}")
+                                self.notify(f"❌ Ошибка закрытия SL: {r}")
+                                # Fallback: закрываем market ордером
+                                try:
+                                    sz = abs(sz)
+                                    r2 = self.trade_api.place_order(
+                                        instId=CONFIG["symbol"],
+                                        tdMode="isolated",
+                                        side="buy",
+                                        ordType="market",
+                                        sz=str(sz),
+                                        posSide="short" if getattr(self, 'use_pos_side', False) else None,
+                                    )
+                                    log.info(f"📤 Fallback market close ответ: {r2}")
+                                    if r2.get("code") == "0":
+                                        log.info(f"✅ Позиция шорт закрыта market ордером")
+                                    else:
+                                        log.error(f"❌ Fallback market close ошибка: {r2}")
+                                except Exception as e2:
+                                    log.error(f"❌ Fallback market close ошибка: {e2}")
+                        except Exception as e:
+                            log.error(f"❌ Ошибка close_positions (шорт): {e}")
+                            self.notify(f"❌ Ошибка закрытия SL: {e}")
         except Exception as e:
             log.error(f"check_per_order_stop_loss ошибка: {e}")
 
@@ -1709,6 +1847,17 @@ class GridBotV3:
         self.notify(f"🚀 Grid Bot V3 (Multi-AI) запущен!\nБаланс: {self.start_balance:.2f} USDT\nЦена: {price:.2f}\nСетка: {self.lower:.2f} — {self.upper:.2f}")
         self.place_grid(price)
         self.start_time = datetime.now()
+
+        # Инициализируем статус
+        status.running = True
+        status.balance = self.start_balance
+        status.price = price
+        status.grid_range = f"{self.lower:.2f} — {self.upper:.2f}"
+        status.last_update = "🚀 Бот запущен!"
+
+        # Рисуем статус первый раз
+        render_status()
+
         trailing_cooldown = 0
         ai_cooldown = 0
         sync_cooldown = 0  # Синхронизация позиций каждые 60 сек
@@ -1726,6 +1875,22 @@ class GridBotV3:
                 except Exception:
                     vol = 0.0
                 self.ai.add_price(price, vol)
+
+                # Обновляем статус
+                status.price = price
+                status.balance = self.get_balance()
+                status.open_orders = self.get_open_order_count()
+                status.grid_range = f"{self.lower:.2f} — {self.upper:.2f}"
+                status.running = True
+
+                # Считаем открытые позиции
+                try:
+                    pr = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                    if pr.get("code") == "0":
+                        pos_list = [p for p in pr.get("data", []) if p.get("instId") == CONFIG["symbol"] and float(p.get("pos", 0)) > 0]
+                        status.open_positions = len(pos_list)
+                except Exception:
+                    pass
 
                 if self.check_global_stops():
                     self.running = False
@@ -1776,8 +1941,12 @@ class GridBotV3:
                     self.grid_levels = self.build_grid(self.lower, self.upper)
                     self.place_grid(price)
 
+                # Отрисовка статуса в консоли
+                render_status()
+
             except Exception as e:
                 log.error(f"Цикл ошибка: {e}")
+                status.add_critical(f"Цикл: {e}")
                 time.sleep(15)
 
     def sync_positions(self):
@@ -2432,10 +2601,6 @@ def main():
             app.run_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
-                read_timeout=30,
-                connect_timeout=30,
-                write_timeout=30,
-                pool_timeout=30,
             )
             break  # Если polling завершился корректно — выходим
         except Exception as e:
