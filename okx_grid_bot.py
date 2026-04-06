@@ -1341,7 +1341,7 @@ class GridBotV3:
                 if getattr(self, 'use_pos_side', False):
                     # Long/short mode — закрываем по сторонам
                     try:
-                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                        r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
                         if r.get("code") == "0":
                             log.info("🔒 Лонг позиции закрыты")
                         else:
@@ -1350,7 +1350,7 @@ class GridBotV3:
                         if "No positions" not in str(e) and "position" not in str(e).lower():
                             log.error(f"Закрытие лонгов ошибка: {e}")
                     try:
-                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                        r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
                         if r.get("code") == "0":
                             log.info("🔒 Шорт позиции закрыты")
                         else:
@@ -1361,7 +1361,7 @@ class GridBotV3:
                 else:
                     # Net mode — закрываем без posSide
                     try:
-                        r = self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
+                        r = self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
                         if r.get("code") == "0":
                             log.info("🔒 Все позиции закрыты (net mode)")
                         else:
@@ -1673,9 +1673,9 @@ class GridBotV3:
                         log.warning(f"🛑 STOP LOSS лонг @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
                         self.notify(f"🛑 STOP LOSS лонг! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
                         if getattr(self, 'use_pos_side', False):
-                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
+                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="long")
                         else:
-                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
+                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
                 elif is_short:
                     sl_price = avg_px * (1 + sl_pct)
                     current_price = self.get_price()
@@ -1683,9 +1683,9 @@ class GridBotV3:
                         log.warning(f"🛑 STOP LOSS шорт @ {avg_px:.2f}, текущая {current_price:.2f}, SL уровень {sl_price:.2f}")
                         self.notify(f"🛑 STOP LOSS шорт! Вход: {avg_px:.2f}, Текущая: {current_price:.2f}")
                         if getattr(self, 'use_pos_side', False):
-                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
+                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated", posSide="short")
                         else:
-                            self.trade_api.close_positions(instType="SWAP", instId=CONFIG["symbol"], mgnMode="isolated")
+                            self.trade_api.close_positions(instId=CONFIG["symbol"], mgnMode="isolated")
         except Exception as e:
             log.error(f"check_per_order_stop_loss ошибка: {e}")
 
@@ -2426,8 +2426,54 @@ def main():
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
     log.info("=" * 55)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем polling с обработкой конфликтов и авто-перезапуском
+    while True:
+        try:
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                read_timeout=30,
+                connect_timeout=30,
+                write_timeout=30,
+                pool_timeout=30,
+            )
+            break  # Если polling завершился корректно — выходим
+        except Exception as e:
+            err_msg = str(e)
+            if "Conflict" in err_msg or "terminated by other" in err_msg:
+                log.error(f"🔴 Конфликт Telegram! Другой экземпляр бота запущен. Жду 60 сек...")
+                time.sleep(60)
+            elif "Server disconnected" in err_msg or "network" in err_msg.lower():
+                log.warning(f"⚠️ Сетевая ошибка Telegram: {e}. Перезапуск через 15 сек...")
+                time.sleep(15)
+            else:
+                log.error(f"🔴 Ошибка Telegram polling: {e}. Перезапуск через 30 сек...")
+                time.sleep(30)
 
 
 if __name__ == "__main__":
-    main()
+    MAX_RESTARTS = 5
+    restart_count = 0
+    
+    while True:
+        try:
+            main()
+            break  # Корректная остановка
+        except KeyboardInterrupt:
+            log.info("🛑 Остановка по Ctrl+C")
+            break
+        except Exception as e:
+            restart_count += 1
+            log.error(f"🔴 Бот упал: {e} (попытка {restart_count}/{MAX_RESTARTS})")
+            if restart_count >= MAX_RESTARTS:
+                log.error("❌ Достигнут лимит перезапусков. Остановка.")
+                break
+            wait_time = min(30 * restart_count, 120)
+            log.info(f"🔄 Перезапуск через {wait_time} сек...")
+            time.sleep(wait_time)
+            # Пересоздаём бота
+            try:
+                bot.stop()
+            except Exception:
+                pass
+            bot = GridBotV3()
