@@ -2426,6 +2426,7 @@ def main():
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
     log.info("=" * 55)
 
+<<<<<<< HEAD
     # Запускаем polling с обработкой конфликтов и авто-перезапуском
     while True:
         try:
@@ -2461,6 +2462,26 @@ if __name__ == "__main__":
             break  # Корректная остановка
         except KeyboardInterrupt:
             log.info("🛑 Остановка по Ctrl+C")
+=======
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    MAX_RESTARTS = 10
+    restart_count = 0
+
+    while True:
+        try:
+            main()
+            log.info("✅ Бот остановлен корректно")
+            break
+        except KeyboardInterrupt:
+            log.info("🛑 Остановка по Ctrl+C")
+            try:
+                bot.stop()
+            except Exception:
+                pass
+>>>>>>> 9473521 (Убрал instType=SWAP из всех 7 вызовов close_positions. Это была единственная ошибка, которая вызывала падение бота при срабатывании стоп-лосса.)
             break
         except Exception as e:
             restart_count += 1
@@ -2471,9 +2492,15 @@ if __name__ == "__main__":
             wait_time = min(30 * restart_count, 120)
             log.info(f"🔄 Перезапуск через {wait_time} сек...")
             time.sleep(wait_time)
+<<<<<<< HEAD
             # Пересоздаём бота
             try:
                 bot.stop()
+=======
+            # Сбрасываем состояние бота
+            try:
+                bot.running = False
+>>>>>>> 9473521 (Убрал instType=SWAP из всех 7 вызовов close_positions. Это была единственная ошибка, которая вызывала падение бота при срабатывании стоп-лосса.)
             except Exception:
                 pass
             bot = GridBotV3()
