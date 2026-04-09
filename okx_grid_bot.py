@@ -1336,6 +1336,7 @@ class GridBotV3:
         self.active_orders = {}
         self._cancelled_ids = set()
         self._synced_positions = {}  # {f"{posSide}_{avg_px:.2f}": True} — уже обработанные позиции
+        self._position_wait_counts = {}  # {f"{posSide}_{avg_px:.2f}": count} — счетчик циклов ожидания
 
         self.realized_pnl = 0.0
         self.trades_count = 0
@@ -2054,6 +2055,168 @@ class GridBotV3:
         except Exception as e:
             log.error(f"check_per_order_stop_loss ошибка: {e}")
 
+    # ── Управление рисками позиций ─────────────────────────────────
+
+    def check_position_risks(self):
+        """
+        Проверяет открытые позиции и оценивает риск:
+        1. Если есть позиция без TP ордера — выставляет TP
+        2. Если позиция долго не закрывается — закрывает немедленно
+        3. Если риск потери > threshold — закрывает немедленно
+        """
+        try:
+            # Получаем баланс для расчета риска
+            balance = self.get_balance()
+            risk_threshold = balance * CONFIG.get("risk_close_threshold", 0.02)  # 2% от баланса
+            max_wait = CONFIG.get("max_wait_cycles", 10) * CONFIG.get("check_interval", 10)  # 100 сек
+
+            # Получаем все открытые позиции
+            r_pos = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+            if r_pos.get("code") != "0":
+                return
+
+            positions_data = r_pos.get("data", [])
+            if not positions_data:
+                return
+
+            # Получаем все открытые ордера
+            r_orders = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
+            open_orders = r_orders.get("data", []) if r_orders.get("code") == "0" else []
+
+            for pos in positions_data:
+                pos_side = pos.get("posSide", "net")
+                avg_px = float(pos.get("avgPx", 0))
+                sz = float(pos.get("pos", 0))
+                upl = float(pos.get("upl", 0))
+                margin = float(pos.get("margin", 0))
+
+                if sz <= 0:
+                    continue
+
+                direction = "long" if pos_side == "long" else "short" if pos_side == "short" else "net"
+                pos_key = f"{pos_side}_{avg_px:.2f}"
+
+                # 1. Проверяем, есть ли TP ордер для этой позиции
+                has_tp_order = False
+                for order in open_orders:
+                    order_side = order.get("side")
+                    order_pos_side = order.get("posSide")
+
+                    # Для лонг позиции TP — это SELL ордер
+                    # Для шорт позиции TP — это BUY ордер
+                    if direction == "long" and order_side == "sell" and order_pos_side == "long":
+                        has_tp_order = True
+                        break
+                    elif direction == "short" and order_side == "buy" and order_pos_side == "short":
+                        has_tp_order = True
+                        break
+
+                # 2. Проверяем, есть ли позиция в synced_positions и сколько она ждет
+                wait_count = self._position_wait_counts.get(pos_key, 0)
+
+                # 3. Оцениваем риск
+                risk_level = abs(upl)  # Абсолютное значение убытка
+
+                log.info(f"🔍 Проверка позиции {direction}: {sz} SOL @ {avg_px:.2f} | UPL: {upl:+.2f} | TP: {'✅' if has_tp_order else '❌'} | Wait: {wait_count}")
+
+                # 4. Если нет TP ордера — выставляем
+                if not has_tp_order:
+                    log.warning(f"⚠️ Позиция {direction} без TP ордера! Выставляю...")
+
+                    if direction == "long":
+                        tp_price = round_price(avg_px * (1 + CONFIG.get("take_profit_pct", 0.5) / 100))
+                        oid = self.place_sell(tp_price, sz, buy_price=avg_px, pos_side="long")
+                        if oid:
+                            log.info(f"✅ Выставлен TP SELL @ {tp_price:.2f} для лонг позиции")
+                            self.notify(f"✅ Выставлен TP для лонг: {sz} SOL @ {avg_px:.2f} → TP: {tp_price:.2f}")
+                        else:
+                            log.error(f"❌ Не удалось выставить TP для лонг позиции")
+                    elif direction == "short":
+                        tp_price = round_price(avg_px * (1 - CONFIG.get("take_profit_pct", 0.5) / 100))
+                        oid = self.place_buy(tp_price, qty=sz, buy_price=avg_px, pos_side="short")
+                        if oid:
+                            log.info(f"✅ Выставлен TP BUY @ {tp_price:.2f} для шорт позиции")
+                            self.notify(f"✅ Выставлен TP для шорт: {sz} SOL @ {avg_px:.2f} → TP: {tp_price:.2f}")
+                        else:
+                            log.error(f"❌ Не удалось выставить TP для шорт позиции")
+
+                    self._synced_positions[pos_key] = True
+                    self._position_wait_counts[pos_key] = 0
+
+                # 5. Если позиция долго ждет — закрываем немедленно
+                elif wait_count >= CONFIG.get("max_wait_cycles", 10):
+                    log.warning(f"⚠️ Позиция {direction} ждет {wait_count} циклов! Закрываю немедленно...")
+                    self.notify(f"⚠️ Позиция {direction} ждет слишком долго! Закрываю: {sz} SOL @ {avg_px:.2f} | UPL: {upl:+.2f}")
+
+                    try:
+                        close_result = self.trade_api.close_positions(
+                            instId=CONFIG["symbol"],
+                            mgnMode="isolated",
+                            posSide=pos_side if pos_side != "net" else "net"
+                        )
+                        if close_result.get("code") == "0":
+                            log.info(f"✅ Позиция {direction} закрыта немедленно")
+                            self.notify(f"✅ Позиция закрыта: {direction} {sz} SOL | UPL: {upl:+.2f}")
+                            # Убираем из synced_positions
+                            self._synced_positions.pop(pos_key, None)
+                            self._position_wait_counts.pop(pos_key, None)
+                        else:
+                            log.error(f"❌ Ошибка закрытия позиции: {close_result}")
+                    except Exception as e:
+                        log.error(f"❌ Ошибка закрытия позиции: {e}")
+                        # Fallback — маркет ордер
+                        try:
+                            if direction == "long":
+                                self.trade_api.place_order(
+                                    instId=CONFIG["symbol"],
+                                    tdMode="isolated",
+                                    side="sell",
+                                    posSide="long",
+                                    ordType="market",
+                                    sz=str(sz)
+                                )
+                            elif direction == "short":
+                                self.trade_api.place_order(
+                                    instId=CONFIG["symbol"],
+                                    tdMode="isolated",
+                                    side="buy",
+                                    posSide="short",
+                                    ordType="market",
+                                    sz=str(sz)
+                                )
+                            log.info(f"✅ Позиция закрыта маркет ордером")
+                            self._synced_positions.pop(pos_key, None)
+                            self._position_wait_counts.pop(pos_key, None)
+                        except Exception as e2:
+                            log.error(f"❌ Fallback маркет ошибка: {e2}")
+
+                # 6. Если риск потери > threshold — закрываем немедленно
+                elif risk_level > risk_threshold and upl < 0:
+                    log.warning(f"🚨 Риск позиции {direction}: {upl:.2f} USDT > {risk_threshold:.2f} USDT! Закрываю...")
+                    self.notify(f"🚨 Высокий риск! Закрываю позицию {direction}: {sz} SOL | UPL: {upl:+.2f} | Лимит: {risk_threshold:.2f}")
+
+                    try:
+                        close_result = self.trade_api.close_positions(
+                            instId=CONFIG["symbol"],
+                            mgnMode="isolated",
+                            posSide=pos_side if pos_side != "net" else "net"
+                        )
+                        if close_result.get("code") == "0":
+                            log.info(f"✅ Позиция {direction} закрыта по риску")
+                            self._synced_positions.pop(pos_key, None)
+                            self._position_wait_counts.pop(pos_key, None)
+                        else:
+                            log.error(f"❌ Ошибка закрытия позиции по риску: {close_result}")
+                    except Exception as e:
+                        log.error(f"❌ Ошибка закрытия позиции по риску: {e}")
+
+                # 7. Увеличиваем счетчик ожидания
+                else:
+                    self._position_wait_counts[pos_key] = wait_count + 1
+
+        except Exception as e:
+            log.error(f"❌ check_position_risks ошибка: {e}")
+
     # ── Основной цикл ─────────────────────────────────────────────
 
     def _loop(self):
@@ -2127,6 +2290,7 @@ class GridBotV3:
 
                 self.check_filled()
                 self.check_per_order_stop_loss()
+                self.check_position_risks()  # Проверка риска открытых позиций
                 self.retry_missing_tp_orders()
                 self.place_pending_sells()
 
