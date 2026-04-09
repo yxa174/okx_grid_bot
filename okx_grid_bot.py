@@ -2222,6 +2222,8 @@ class GridBotV3:
     def _loop(self):
         self.setup_account()
         self.start_balance = self.get_balance()
+
+        # Прогрев AI один раз при запуске
         try:
             df15 = self.get_klines(interval="15m", limit=200)
             for c, v in zip(reversed(df15["close"].tolist()), reversed(df15["vol"].tolist())):
@@ -2238,6 +2240,13 @@ class GridBotV3:
         self.place_grid(price)
         self.start_time = datetime.now()
 
+        # Кэшированные данные (обновляются редко)
+        cached_balance = self.start_balance
+        cached_orders_count = 0
+        cached_positions = 0
+        balance_update_counter = 0  # Счетчик для обновления баланса раз в N циклов
+        positions_update_counter = 0  # Счетчик для обновления позиций раз в N циклов
+
         # Инициализируем статус
         status.running = True
         status.balance = self.start_balance
@@ -2250,15 +2259,26 @@ class GridBotV3:
 
         trailing_cooldown = 0
         ai_cooldown = 0
-        sync_cooldown = 0  # Синхронизация позиций каждые 60 сек
+        sync_cooldown = 0
+        risk_check_counter = 0  # Проверка риска позиций
+
+        # Определяем частоту обновлений в зависимости от low_cpu_mode
+        low_cpu = CONFIG.get("low_cpu_mode", False)
+        balance_update_every = 6 if low_cpu else 2  # Обновлять баланс раз в 180 сек (6*30) или 60 сек
+        positions_update_every = 12 if low_cpu else 4  # Обновлять позиции раз в 360 сек или 120 сек
+        risk_check_every = 6 if low_cpu else 2  # Проверка риска раз в 180 сек или 60 сек
 
         while self.running:
             try:
+                # Sleep НЕ потребляет CPU seconds!
                 time.sleep(CONFIG["check_interval"])
                 if not self.running:
                     break
+
                 price = self.get_price()
                 self.last_price = price
+
+                # Добавляем цену в AI (легкая операция)
                 try:
                     df = self.get_klines(interval="15m", limit=1)
                     vol = float(df["vol"].iloc[-1])
@@ -2266,34 +2286,57 @@ class GridBotV3:
                     vol = 0.0
                 self.ai.add_price(price, vol)
 
-                # Обновляем статус
+                # Обновляем баланс реже (экономия CPU)
+                balance_update_counter += 1
+                if balance_update_counter >= balance_update_every:
+                    cached_balance = self.get_balance()
+                    cached_orders_count = self.get_open_order_count()
+                    balance_update_counter = 0
+
+                # Обновляем позиции еще реже
+                positions_update_counter += 1
+                if positions_update_counter >= positions_update_every:
+                    try:
+                        pr = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                        if pr.get("code") == "0":
+                            pos_list = [p for p in pr.get("data", []) if p.get("instId") == CONFIG["symbol"] and float(p.get("pos", 0)) > 0]
+                            cached_positions = len(pos_list)
+                    except Exception:
+                        pass
+                    positions_update_counter = 0
+
+                # Обновляем статус (легкая операция)
                 status.price = price
-                status.balance = self.get_balance()
-                status.open_orders = self.get_open_order_count()
+                status.balance = cached_balance
+                status.open_orders = cached_orders_count
                 status.grid_range = f"{self.lower:.2f} — {self.upper:.2f}"
+                status.open_positions = cached_positions
                 status.running = True
 
-                # Считаем открытые позиции
-                try:
-                    pr = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
-                    if pr.get("code") == "0":
-                        pos_list = [p for p in pr.get("data", []) if p.get("instId") == CONFIG["symbol"] and float(p.get("pos", 0)) > 0]
-                        status.open_positions = len(pos_list)
-                except Exception:
-                    pass
-
+                # Проверка глобальных стопов (легкая)
                 if self.check_global_stops():
                     self.running = False
                     self.cancel_all()
                     self.close_all_positions()
                     break
 
+                # Проверка исполненных ордеров (API вызов - делаем каждый цикл)
                 self.check_filled()
+
+                # Проверка стоп-лосов по позициям (легкая, использует кэш)
                 self.check_per_order_stop_loss()
-                self.check_position_risks()  # Проверка риска открытых позиций
+
+                # Проверка риска позиций (API вызовы - делаем реже)
+                risk_check_counter += 1
+                if risk_check_counter >= risk_check_every:
+                    self.check_position_risks()
+                    risk_check_counter = 0
+
+                # Retry ордеров (легкая операция)
                 self.retry_missing_tp_orders()
                 self.place_pending_sells()
 
+                # AI анализ (тяжелый - делаем редко)
                 if ai_cooldown > 0:
                     ai_cooldown -= 1
                 else:
@@ -2302,19 +2345,21 @@ class GridBotV3:
                     self.last_signal = self.ensemble.analyze(
                         price, indicators, pos_size, self.realized_pnl, self.lower, self.upper
                     )
-                    ai_cooldown = CONFIG.get("ai_analysis_interval", 900) // CONFIG.get("check_interval", 10)
+                    ai_cooldown = CONFIG.get("ai_analysis_interval", 900) // CONFIG.get("check_interval", 30)
 
-                # Синхронизация позиций каждые 60 сек
+                # Синхронизация позиций (делаем реже в low_cpu_mode)
                 if sync_cooldown > 0:
                     sync_cooldown -= 1
                 else:
                     self.sync_positions()
-                    sync_cooldown = 6  # 60 сек / 10 сек интервал
+                    sync_cooldown = 12 if low_cpu else 6  # 360 сек или 180 сек
 
+                # Авто-бэктест (файловая операция - редко)
                 auto_bt = self.backtester.check_auto_run()
                 if auto_bt:
                     self.notify(auto_bt)
 
+                # Trailing (редко)
                 if trailing_cooldown > 0:
                     trailing_cooldown -= 1
                 elif price > self.upper:
@@ -2326,14 +2371,16 @@ class GridBotV3:
                     self.trailing_down(price)
                     trailing_cooldown = 30
 
+                # Пересоздание сетки если нет ордеров (редко проверяем)
                 buy_cnt = sum(1 for o in self.active_orders.values() if o["type"] == "BUY")
-                if buy_cnt == 0 and self.get_open_order_count() == 0:
+                if buy_cnt == 0 and cached_orders_count == 0:
                     self.lower, self.upper = self.calc_atr_range(price)
                     self.grid_levels = self.build_grid(self.lower, self.upper)
                     self.place_grid(price)
 
-                # Отрисовка статуса в консоли
-                render_status()
+                # Отрисовка статуса в консоли (только если не low_cpu_mode)
+                if not low_cpu:
+                    render_status()
 
             except Exception as e:
                 log.error(f"Цикл ошибка: {e}")

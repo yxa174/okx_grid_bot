@@ -44,7 +44,8 @@ CONFIG: dict = {
     "global_tp_usdt":   40.0,       # Стоп бота если profit > 40 USDT
 
     # ── Скорость ──────────────────────────────────────────────────
-    "check_interval":   10,         # Проверка каждые 10 секунд
+    "check_interval":   30,         # Проверка каждые 30 секунд (экономия CPU на PythonAnywhere)
+    "low_cpu_mode":     True,       # Режим экономии CPU для PythonAnywhere
 
     # ── TP/SL ──────────────────────────────────────────────────────
     "take_profit_pct":  0.5,        # Take Profit % (0.5 = 0.5%)
