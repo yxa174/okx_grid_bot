@@ -32,6 +32,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -59,19 +60,33 @@ from config import (
 MAX_ORDERS = 50
 MIN_QTY = 0.1
 
+# Основной логгер бота
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.handlers.RotatingFileHandler(
             "bot.log",
-            maxBytes=5*1024*1024,
+            maxBytes=5*1024*1024,  # 5 MB
             backupCount=3,
             encoding="utf-8"
         ),
     ],
 )
+
+# Отдельный логгер для AI решений
+ai_log_handler = logging.handlers.RotatingFileHandler(
+    "ai_decisions.log",
+    maxBytes=2*1024*1024,  # 2 MB
+    backupCount=2,
+    encoding="utf-8"
+)
+ai_logger = logging.getLogger("AI_Decisions")
+ai_logger.setLevel(logging.INFO)
+ai_logger.addHandler(ai_log_handler)
+ai_logger.propagate = False  # Не дублировать в основной лог
+
 # Отключаем HTTP логи от библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -260,6 +275,76 @@ class MarketDataProvider:
         days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
         return days[datetime.now(timezone.utc).weekday()]
 
+    def get_multi_timeframe_data(self, market_api, symbol: str = "SOL-USDT-SWAP") -> dict:
+        """Получает OHLCV данные с разных таймфреймов для multi-timeframe анализа"""
+        timeframes = {
+            "M5": "5m",
+            "M15": "15m",
+            "H1": "1H",
+            "H4": "4H"
+        }
+
+        result = {}
+
+        for tf_name, tf_value in timeframes.items():
+            try:
+                # Получаем последние 20 свечей для каждого таймфрейма
+                candles = market_api.get_candlesticks(
+                    instId=symbol,
+                    bar=tf_value,
+                    limit="20"
+                )
+
+                if candles.get('code') == '0' and candles.get('data'):
+                    # OKX возвращает данные в обратном порядке (новые сначала)
+                    data = candles['data']
+
+                    # Преобразуем в удобный формат
+                    ohlcv = []
+                    for candle in reversed(data):  # Переворачиваем, чтобы старые были сначала
+                        ts, o, h, l, c, vol, vol_ccy, vol_ccy_quote = candle
+                        ohlcv.append({
+                            'timestamp': int(ts),
+                            'open': float(o),
+                            'high': float(h),
+                            'low': float(l),
+                            'close': float(c),
+                            'volume': float(vol)
+                        })
+
+                    # Вычисляем простые метрики
+                    if len(ohlcv) >= 2:
+                        current = ohlcv[-1]
+                        previous = ohlcv[-2]
+                        change_pct = ((current['close'] - previous['close']) / previous['close']) * 100
+
+                        # Определяем тренд по EMA
+                        closes = pd.Series([c['close'] for c in ohlcv])
+                        ema_fast = closes.ewm(span=8).mean()
+                        ema_slow = closes.ewm(span=20).mean()
+
+                        trend = "BULLISH" if ema_fast.iloc[-1] > ema_slow.iloc[-1] else "BEARISH"
+
+                        result[tf_name] = {
+                            'current_price': current['close'],
+                            'change_pct': change_pct,
+                            'trend': trend,
+                            'high': current['high'],
+                            'low': current['low'],
+                            'volume': current['volume'],
+                            'ema_fast': ema_fast.iloc[-1],
+                            'ema_slow': ema_slow.iloc[-1]
+                        }
+                    else:
+                        result[tf_name] = None
+                else:
+                    result[tf_name] = None
+            except Exception as e:
+                log.warning(f"⚠️ Ошибка получения данных {tf_name}: {e}")
+                result[tf_name] = None
+
+        return result
+
     def get_market_context(self, sol_price: float) -> dict:
         btc = self.get_btc_data()
         fg = self.get_fear_greed()
@@ -383,21 +468,50 @@ class AIAnalyzer:
 # ══════════════════════════════════════════════════════════════════
 
 class LLMProvider:
-    """Базовый класс для LLM провайдеров"""
+    """Базовый класс для LLM провайдеров с ограниченным кэшем"""
     name = "base"
-    cache = {}
     cache_ttl = CONFIG.get("ai_cache_ttl", 900)
+    cache_maxsize = 100  # Ограничение кэша на провайдер
+
+    def __init__(self):
+        # Instance-level bounded cache
+        self._cache_dict = {}  # key -> (timestamp, result)
+        self._cache_order = []  # List to track insertion order (oldest first)
 
     def _is_cached(self, key: str) -> bool:
-        if key in self.cache:
-            return time.time() - self.cache[key]["ts"] < self.cache_ttl
+        if key in self._cache_dict:
+            ts, _ = self._cache_dict[key]
+            if time.time() - ts < self.cache_ttl:
+                return True
+            else:
+                # TTL expired, remove from cache
+                del self._cache_dict[key]
+                return False
         return False
 
     def _get_cached(self, key: str):
-        return self.cache.get(key)
+        if key in self._cache_dict:
+            return self._cache_dict[key][1]
+        return None
 
     def _set_cache(self, key: str, value: dict):
-        self.cache[key] = {**value, "ts": time.time()}
+        # Remove expired entries first
+        cutoff = time.time() - self.cache_ttl
+        expired_keys = [k for k, (ts, _) in self._cache_dict.items() if ts < cutoff]
+        for k in expired_keys:
+            del self._cache_dict[k]
+            if k in self._cache_order:
+                self._cache_order.remove(k)
+
+        # Enforce maxsize: remove oldest entries if over limit
+        while len(self._cache_dict) >= self.cache_maxsize and self._cache_order:
+            oldest_key = self._cache_order.pop(0)
+            if oldest_key in self._cache_dict:
+                del self._cache_dict[oldest_key]
+
+        # Add new entry
+        self._cache_order.append(key)
+        self._cache_dict[key] = (time.time(), value)
 
     def get_signal(self, prompt: str) -> dict:
         raise NotImplementedError
@@ -422,6 +536,10 @@ class GeminiProvider(LLMProvider):
             result = self._parse_response(text)
             self._set_cache(cache_key, result)
             log.info(f"🔮 Gemini: {result['signal']} (conf={result['confidence']:.2f})")
+            ai_logger.info(
+                f"GEMINI │ Signal: {result['signal']} │ Conf: {result['confidence']:.2f} │ "
+                f"Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+            )
             return result
         except Exception as e:
             log.warning(f"Gemini ошибка: {e}")
@@ -477,6 +595,10 @@ class GroqProvider(LLMProvider):
             result = self._parse_response(text)
             self._set_cache(cache_key, result)
             log.info(f"🔮 Groq: {result['signal']} (conf={result['confidence']:.2f})")
+            ai_logger.info(
+                f"GROQ │ Signal: {result['signal']} │ Conf: {result['confidence']:.2f} │ "
+                f"Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+            )
             return result
         except Exception as e:
             log.warning(f"Groq ошибка: {e}")
@@ -539,6 +661,10 @@ class OpenRouterProvider(LLMProvider):
             result = self._parse_response(text)
             self._set_cache(cache_key, result)
             log.info(f"🔮 OpenRouter: {result['signal']} (conf={result['confidence']:.2f})")
+            ai_logger.info(
+                f"OPENROUTER │ Signal: {result['signal']} │ Conf: {result['confidence']:.2f} │ "
+                f"Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+            )
             return result
         except Exception as e:
             log.warning(f"OpenRouter ошибка: {e}")
@@ -596,6 +722,10 @@ class CohereProvider(LLMProvider):
             result = self._parse_response(text)
             self._set_cache(cache_key, result)
             log.info(f"🔮 Cohere: {result['signal']} (conf={result['confidence']:.2f})")
+            ai_logger.info(
+                f"COHERE │ Signal: {result['signal']} │ Conf: {result['confidence']:.2f} │ "
+                f"Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+            )
             return result
         except Exception as e:
             log.warning(f"Cohere ошибка: {e}")
@@ -653,6 +783,10 @@ class DeepSeekProvider(LLMProvider):
             result = self._parse_response(text)
             self._set_cache(cache_key, result)
             log.info(f"🔮 DeepSeek: {result['signal']} (conf={result['confidence']:.2f})")
+            ai_logger.info(
+                f"DEEPSEEK │ Signal: {result['signal']} │ Conf: {result['confidence']:.2f} │ "
+                f"Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+            )
             return result
         except Exception as e:
             log.warning(f"DeepSeek ошибка: {e}")
@@ -693,9 +827,10 @@ class DeepSeekProvider(LLMProvider):
 class AIEnsemble:
     """Управляет голосованием всех AI моделей, адаптивными весами, памятью и CSV"""
 
-    def __init__(self, ai_analyzer: AIAnalyzer, market_data: MarketDataProvider):
+    def __init__(self, ai_analyzer: AIAnalyzer, market_data: MarketDataProvider, market_api=None):
         self.ai = ai_analyzer
         self.market = market_data
+        self.market_api = market_api  # Для получения multi-timeframe данных
         self.weights = {
             "lstm": 1.0,
             "gemini": 1.0,
@@ -731,8 +866,8 @@ class AIEnsemble:
 
     def _build_prompt(self, price: float, indicators: dict, position_size: float,
                       realized_pnl: float, grid_lower: float, grid_upper: float,
-                      provider: str = None) -> str:
-        """Создаёт промт для AI с учётом стратегии провайдера"""
+                      provider: str = None, multi_tf_data: dict = None) -> str:
+        """Создаёт улучшенный промт для AI с multi-timeframe анализом"""
         ctx = self.market.get_market_context(price)
 
         # Получаем стратегию для провайдера
@@ -744,13 +879,18 @@ class AIEnsemble:
             risk = strategy.get("risk", CONFIG.get("ai_risk"))
             instruction = strategy.get("instruction", "")
             min_conf = strategy.get("min_confidence", 0.6)
+            agent_type = strategy.get("agent_type", "analyst")
+            timeframe = strategy.get("timeframe", "1H")
         else:
             role = CONFIG.get("ai_role", "профессиональный крипто-трейдер")
             style = CONFIG.get("ai_style", "свинг-трейдинг")
             risk = CONFIG.get("ai_risk", "умеренный")
             instruction = ""
             min_conf = 0.6
+            agent_type = "analyst"
+            timeframe = "1H"
 
+        # Формируем текст памяти (последние 5 решений)
         memory_text = ""
         if self.memory:
             recent = list(self.memory)[-5:]
@@ -761,50 +901,100 @@ class AIEnsemble:
                 lines.append(f"{i}. {m['signal']} @ {m.get('price', 0):.2f} → {pnl_str} USDT {emoji}")
             memory_text = "\n\n📝 ПОСЛЕДНИЕ РЕШЕНИЯ:\n" + "\n".join(lines)
 
-        trend = "Бычий" if indicators.get("ma20", 0) > indicators.get("ma50", 0) else "Медвежий"
+        # Определяем тренд
+        trend = "🟢 БЫЧИЙ" if indicators.get("ma20", 0) > indicators.get("ma50", 0) else "🔴 МЕДВЕЖИЙ"
         price_change_24h = 0
         if self.ai.price_history:
             prices = list(self.ai.price_history)
             if len(prices) > 10:
                 price_change_24h = ((prices[-1] - prices[-10]) / prices[-10]) * 100
 
-        prompt = f"""Ты {role}.
-Стиль: {style}.
-Риск-профиль: {risk}.
+        # Multi-timeframe данные
+        multi_tf_text = ""
+        if multi_tf_data and any(v is not None for v in multi_tf_data.values()):
+            multi_tf_lines = ["\n📊 MULTI-TIMEFRAME АНАЛИЗ:"]
+            for tf_name in ["M5", "M15", "H1", "H4"]:
+                tf_data = multi_tf_data.get(tf_name)
+                if tf_data:
+                    trend_icon = "🟢" if tf_data['trend'] == "BULLISH" else "🔴"
+                    multi_tf_lines.append(
+                        f"{tf_name}: {tf_data['current_price']:.2f} "
+                        f"({tf_data['change_pct']:+.2f}%) "
+                        f"{trend_icon} {tf_data['trend']}"
+                    )
+                else:
+                    multi_tf_lines.append(f"{tf_name}: нет данных")
+            multi_tf_text = "\n".join(multi_tf_lines)
+        else:
+            multi_tf_text = "\n📊 MULTI-TIMEFRAME АНАЛИЗ: данные недоступ"
 
-📊 ТЕКУЩИЕ ДАННЫЕ SOL/USDT:
-Цена: ${price:.2f} | Изм: {price_change_24h:+.1f}%
-BTC: ${ctx['btc_price']:,.0f} | Доминация: {ctx['btc_dominance']}%
-Fear & Greed Index: {ctx['fear_greed_value']}/100 ({ctx['fear_greed_label']})
-Корреляция SOL/BTC: {ctx['sol_btc_correlation']}
+        # Формируем OHLCV блок для 1H таймфрейма
+        ohlcv_text = ""
+        if multi_tf_data and multi_tf_data.get("H1"):
+            h1_data = multi_tf_data["H1"]
+            ohlcv_text = f"""
+📈 ПОСЛЕДНИЕ СВЕЧИ (H1):
+Текущая: O={h1_data['current_price']:.2f} H={h1_data['high']:.2f} L={h1_data['low']:.2f}
+Объём: {h1_data['volume']:.0f} SOL"""
 
-📈 ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ:
-RSI(14): {indicators.get('rsi', '—')}
-MACD: {indicators.get('macd_hist', '—')}
-BB: [{indicators.get('bb_lower', '—')} — {indicators.get('bb_upper', '—')}]
-MA20: {indicators.get('ma20', '—')} | MA50: {indicators.get('ma50', '—')}
-Тренд: {trend}
+        prompt = f"""<SYSTEM>
+{role}
+Стиль торговли: {style}
+Риск-профиль: {risk}
+Тип агента: {agent_type}
+Рабочий таймфрейм: {timeframe}
+</SYSTEM>
 
-🕐 КОНТЕКСТ:
-Сессия: {ctx['trading_session']}
-День: {ctx['day_of_week']}
+<РЫНОЧНЫЕ ДАННЫЕ>
+💰 SOL/USDT ТЕКУЩАЯ ЦЕНА: ${price:.2f}
+📉 Изменение за период: {price_change_24h:+.1f}%
 
-💼 ПОЗИЦИЯ БОТА:
-Размер: {position_size:.2f} SOL | PnL: {realized_pnl:+.2f} USDT
-Сетка: {grid_lower:.2f} — {grid_upper:.2f}{memory_text}
+₿ BTC ДАННЫЕ:
+• Цена: ${ctx['btc_price']:,.0f}
+• Доминация: {ctx['btc_dominance']}%
 
-🔥 СТРАТЕГИЯ:
+😨 ИНДЕКС СТРАХА И ЖАДНОСТИ:
+• Значение: {ctx['fear_greed_value']}/100
+• Статус: {ctx['fear_greed_label']}
+
+🔗 КОРРЕЛЯЦИЯ SOL/BTC: {ctx['sol_btc_correlation']}
+{multi_tf_text}
+{ohlcv_text}
+</РЫНОЧНЫЕ ДАННЫЕ>
+
+<ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ>
+📊 RSI(14): {indicators.get('rsi', '—')}
+📊 MACD Histogram: {indicators.get('macd_hist', '—')}
+📊 Bollinger Bands: [{indicators.get('bb_lower', '—')} — {indicators.get('bb_upper', '—')}]
+📊 MA(20): {indicators.get('ma20', '—')}
+📊 MA(50): {indicators.get('ma50', '—')}
+📊 Текущий тренд: {trend}
+</ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ>
+
+<КОНТЕКСТ ТОРГОВЛИ>
+🕐 Торговая сессия: {ctx['trading_session']}
+📅 День недели: {ctx['day_of_week']}
+
+💼 СОСТОЯНИЕ БОТА:
+• Позиция: {position_size:.2f} SOL
+• Реализованный PnL: {realized_pnl:+.2f} USDT
+• Диапазон сетки: {grid_lower:.2f} — {grid_upper:.2f}{memory_text}
+</КОНТЕКСТ ТОРГОВЛИ>
+
+<ИНСТРУКЦИЯ АГЕНТА>
 {instruction}
+</ИНСТРУКЦИЯ АГЕНТА>
 
-Задача: Верни сигнал STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL
-и confidence от 0.0 до 1.0.
+<ФОРМАТ ОТВЕТА>
+Ты должен вернуть сигнал и уверенность в следующем формате:
+
+Signal: <один из: STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL>
+Confidence: <число от 0.0 до 1.0>
+Reasoning: <краткое обоснование решения в 1-3 предложениях>
+
 Минимальная уверенность для сигнала: {min_conf}
-Кратко обоснуй (1-2 предложения).
-
-Формат ответа:
-Signal: <сигнал>
-Confidence: <0.0-1.0>
-Reasoning: <обоснование>"""
+Если уверенность ниже минимальной — верни NEUTRAL.
+</ФОРМАТ ОТВЕТА>"""
 
         return prompt
 
@@ -817,8 +1007,20 @@ Reasoning: <обоснование>"""
 
         self.last_analysis_time = now
 
+        # Получаем multi-timeframe данные один раз для всех провайдеров
+        multi_tf_data = {}
+        if self.market_api and CONFIG.get("ai_multi_timeframe", False):
+            try:
+                multi_tf_data = self.market.get_multi_timeframe_data(self.market_api)
+                log.info(f"📊 Multi-timeframe данные получены: {sum(1 for v in multi_tf_data.values() if v is not None)}/4 таймфреймов")
+            except Exception as e:
+                log.warning(f"⚠️ Ошибка получения multi-timeframe данных: {e}")
+
         # AI Fallback - пробуем провайдеры по очереди
-        result = self._analyze_with_fallback(price, indicators, position_size, realized_pnl, grid_lower, grid_upper)
+        result = self._analyze_with_fallback(
+            price, indicators, position_size, realized_pnl,
+            grid_lower, grid_upper, multi_tf_data
+        )
 
         if result:
             self.last_llm_results = {"fallback": result}
@@ -830,8 +1032,9 @@ Reasoning: <обоснование>"""
         return self._get_last_ensemble()
 
     def _analyze_with_fallback(self, price: float, indicators: dict, position_size: float,
-                                realized_pnl: float, grid_lower: float, grid_upper: float) -> dict:
-        """AI с fallback - пробуем провайдеры по очереди"""
+                                realized_pnl: float, grid_lower: float, grid_upper: float,
+                                multi_tf_data: dict = None) -> dict:
+        """AI с fallback - пробуем провайдеры по очереди с multi-timeframe данными"""
         providers_order = ["gemini", "groq", "openrouter", "cohere", "deepseek"]
 
         for provider_name in providers_order:
@@ -845,10 +1048,12 @@ Reasoning: <обоснование>"""
                     log.warning(f"⚠️ {provider_name} недоступен, пробую следующий")
                     continue
 
-                # Создаём промт
+                # Создаём промт с multi-timeframe данными
                 prompt = self._build_prompt(
                     price, indicators, position_size, realized_pnl,
-                    grid_lower, grid_upper, provider=provider_name
+                    grid_lower, grid_upper,
+                    provider=provider_name,
+                    multi_tf_data=multi_tf_data
                 )
 
                 # Вызываем AI
@@ -856,6 +1061,10 @@ Reasoning: <обоснование>"""
 
                 # Успех - логируем и возвращаем
                 log.info(f"🧠 {provider_name}: {result.get('signal', 'N/A')} (conf={result.get('confidence', 0):.2f})")
+                ai_logger.info(
+                    f"ENSEMBLE │ Provider: {provider_name.upper()} │ Signal: {result.get('signal', 'N/A')} │ "
+                    f"Conf: {result.get('confidence', 0):.2f} │ Reasoning: {result.get('reasoning', 'N/A')[:100]}"
+                )
                 return result
 
             except Exception as e:
@@ -947,6 +1156,24 @@ Reasoning: <обоснование>"""
                 self.weights = {k: round(v / total, 4) for k, v in self.weights.items()}
 
     def _save_to_csv(self, price: float, indicators: dict, results: dict, ensemble: dict):
+        # Rotate CSV if too large (keep last 5000 rows)
+        max_csv_rows = 5000
+        try:
+            if os.path.exists(self.csv_file):
+                with open(self.csv_file, "r", encoding="utf-8") as f:
+                    row_count = sum(1 for _ in f) - 1  # Exclude header
+                if row_count >= max_csv_rows:
+                    # Keep only last 4000 rows
+                    with open(self.csv_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    header = lines[0]
+                    recent_rows = lines[-4000:]
+                    with open(self.csv_file, "w", encoding="utf-8") as f:
+                        f.writelines([header] + recent_rows)
+                    log.info(f"🔄 CSV ротация: удалены старые строки, оставлено 4000")
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка ротации CSV: {e}")
+
         ctx = self.market.get_market_context(price)
         with open(self.csv_file, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -1121,7 +1348,7 @@ class GridBotV3:
 
         self.ai = AIAnalyzer()
         self.market = MarketDataProvider()
-        self.ensemble = AIEnsemble(self.ai, self.market)
+        self.ensemble = AIEnsemble(self.ai, self.market, self.market_api)
         self.backtester = Backtester(self.ensemble)
         self.last_signal = {"signal": "NEUTRAL", "score": 0, "confidence": 0.5, "providers": {}, "indicators": {}}
         self.pending_sells = []  # [(price, qty), ...] — ждут появления SOL
@@ -2007,8 +2234,123 @@ class GridBotV3:
                 if key not in current_keys:
                     del self._synced_positions[key]
 
+            # Safety: ограничиваем размер _synced_positions
+            max_synced = 100
+            if len(self._synced_positions) > max_synced:
+                # Удаляем самые старые записи (если их слишком много)
+                keys_to_remove = list(self._synced_positions.keys())[:len(self._synced_positions) - max_synced]
+                for key in keys_to_remove:
+                    del self._synced_positions[key]
+                log.warning(f"🔄 _synced_positions очищен: удалено {len(keys_to_remove)} записей")
+
         except Exception as e:
             log.warning(f"Синхронизация позиций ошибка: {e}")
+
+    def sync_existing_orders_and_positions(self):
+        """Синхронизирует существующие ордеры и позиции с биржи при запуске"""
+        log.info("🔄 Синхронизация ордеров и позиций с биржи...")
+
+        try:
+            # 1. Получаем все открытые ордера
+            r = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
+            self._check_okx_response(r)
+
+            orders_data = r.get("data", [])
+            log.info(f"📋 Найдено {len(orders_data)} открытых ордеров на бирже")
+
+            # Синхронизируем ордера
+            for order in orders_data:
+                ord_id = order.get("ordId")
+                price = float(order.get("px", 0))
+                qty = float(order.get("sz", 0))
+                side = order.get("side")  # "buy" или "sell"
+                pos_side = order.get("posSide", "net")  # "long", "short", или "net"
+                ord_type = order.get("ordType", "limit")
+
+                # Определяем тип ордера для бота
+                if side == "buy":
+                    bot_type = "BUY"
+                else:
+                    bot_type = "SELL"
+
+                # Добавляем в active_orders
+                self.active_orders[ord_id] = {
+                    "price": price,
+                    "type": bot_type,
+                    "qty": qty,
+                    "pos_side": pos_side,
+                    "buy_price": price if bot_type == "BUY" else None,
+                    "ord_type": ord_type
+                }
+
+                log.info(f"  📌 Ордер {ord_id}: {bot_type} {qty} @ {price:.2f} ({pos_side})")
+
+            log.info(f"✅ Синхронизировано {len(self.active_orders)} ордеров")
+
+            # 2. Получаем все открытые позиции
+            r_pos = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+            self._check_okx_response(r_pos)
+
+            positions_data = r_pos.get("data", [])
+            log.info(f"📋 Найдено {len(positions_data)} открытых позиций на бирже")
+
+            if positions_data:
+                for pos in positions_data:
+                    pos_side = pos.get("posSide", "net")
+                    avg_px = float(pos.get("avgPx", 0))
+                    sz = float(pos.get("pos", 0))
+                    upl = float(pos.get("upl", 0))
+                    margin = float(pos.get("margin", 0))
+
+                    direction = "🟢 LONG" if pos_side == "long" else "🔴 SHORT" if pos_side == "short" else "⚪ NET"
+
+                    log.info(f"  💼 Позиция {direction}: {sz} SOL @ {avg_px:.2f} | UPL: {upl:+.2f} USDT | Margin: {margin:.2f}")
+
+                    # Добавляем в synced_positions чтобы не обрабатывать повторно
+                    pos_key = f"{pos_side}_{avg_px:.2f}"
+                    self._synced_positions[pos_key] = True
+
+                    # Обновляем avg_buy_price если это лонг
+                    if pos_side == "long" and sz > 0:
+                        self.avg_buy_price = avg_px
+                        self.total_sol_bought = sz
+                        log.info(f"    📊 Обновлен avg_buy_price: {self.avg_buy_price:.2f}")
+
+                # Уведомление в Telegram
+                pos_summary = f"🔄 Обнаружено позиций на бирже: {len(positions_data)}\n"
+                for pos in positions_data:
+                    pos_side = pos.get("posSide", "net")
+                    avg_px = float(pos.get("avgPx", 0))
+                    sz = float(pos.get("pos", 0))
+                    upl = float(pos.get("upl", 0))
+
+                    direction = "🟢 LONG" if pos_side == "long" else "🔴 SHORT" if pos_side == "short" else "⚪ NET"
+                    pos_summary += f"\n{direction}: {sz} SOL @ {avg_px:.2f} | PnL: {upl:+.2f} USDT"
+
+                pos_summary += f"\n\n📋 Ордеров: {len(self.active_orders)}"
+                self.notify(pos_summary)
+            else:
+                log.info("✅ Нет открытых позиций")
+                self.notify("✅ Бот запущен, нет открытых позиций")
+
+            # Итоговая сводка
+            total_orders = len(self.active_orders)
+            total_positions = len(positions_data)
+
+            log.info(f"✅ Синхронизация завершена: {total_orders} ордеров, {total_positions} позиций")
+
+            return {
+                "orders": total_orders,
+                "positions": total_positions
+            }
+
+        except Exception as e:
+            log.error(f"❌ Ошибка синхронизации: {e}")
+            self.notify(f"⚠️ Ошибка синхронизации: {e}")
+            return {
+                "orders": 0,
+                "positions": 0
+            }
 
     def start(self) -> bool:
         if self.running:
@@ -2032,85 +2374,192 @@ class GridBotV3:
         self.notify("🛑 Экстренная остановка")
 
     def status_text(self) -> str:
+        """Улучшенный формат статуса бота"""
         uptime = ""
         if self.start_time:
             d = datetime.now() - self.start_time
             h, m = divmod(int(d.total_seconds()), 3600)
             m, s = divmod(m, 60)
-            uptime = f"{h}ч {m}м {s}с"
+            uptime = f"{h:02d}:{m:02d}:{s:02d}"
+
         buys = sum(1 for o in self.active_orders.values() if o["type"] == "BUY")
         sells = sum(1 for o in self.active_orders.values() if o["type"] == "SELL")
         unrealized = self.get_unrealized_pnl()
+        total_pnl = self.realized_pnl + unrealized
         ctx = self.market.get_market_context(self.last_price)
+
+        # Эмодзи для статуса
+        status_emoji = "🟢" if self.running else "🔴"
+        status_text = "РАБОТАЕТ" if self.running else "ОСТАНОВЛЕН"
+
+        # Эмодзи для PnL
+        pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+        pnl_sign = "+" if total_pnl >= 0 else ""
+
         lines = [
-            f"{'🟢 РАБОТАЕТ' if self.running else '🔴 ОСТАНОВЛЕН'}",
-            "", "📊 *Сетка*",
-            f"Пара: `{CONFIG['symbol']}`",
-            f"Диапазон: `{self.lower:.2f} — {self.upper:.2f}`",
-            f"Уровней: `{CONFIG['grid_levels']}`",
-            "", "📈 *Статистика*",
-            f"Uptime: `{uptime}`",
-            f"Сделок: `{self.trades_count}`",
-            f"PnL реализованный: `{self.realized_pnl:+.4f} USDT`",
-            f"PnL нереализованный: `{unrealized:+.4f} USDT`",
-            f"PnL итого: `{self.realized_pnl + unrealized:+.4f} USDT`",
-            f"Баланс: `{self.get_balance():.2f} USDT`",
-            "", "📋 *Ордера*",
-            f"BUY: `{buys}` | SELL: `{sells}`",
-            "", "🛡 *Защиты*",
-            f"SL: `-{CONFIG.get('global_sl_usdt', 25):.0f} USDT`",
-            f"TP: `+{CONFIG.get('global_tp_usdt', 40):.0f} USDT`",
+            f"{status_emoji} *СТАТУС БОТА* {status_text}",
+            f"⏱ Uptime: `{uptime}`",
+            "",
+            "━" * 15 + "💰 *ПОРТФЕЛЬ*" + "━" * 15,
+            f"💵 Баланс: `{self.get_balance():.2f} USDT`",
+            f"📊 PnL Реализованный: `{self.realized_pnl:+.2f} USDT`",
+            f"📈 PnL Нереализованный: `{unrealized:+.2f} USDT`",
+            f"{pnl_emoji} *PnL Итого: `{pnl_sign}{total_pnl:.2f} USDT`*",
+            "",
+            "━" * 15 + "📊 *СЕТКА*" + "━" * 15,
+            f"💱 Пара: `{CONFIG['symbol']}`",
+            f"📏 Диапазон: `{self.lower:.2f} — {self.upper:.2f} USDT`",
+            f"📐 Уровней: `{CONFIG['grid_levels']}`",
+            f"🛒 BUY ордеров: `{buys}` | 📤 SELL ордеров: `{sells}`",
+            f"📋 Всего ордеров: `{len(self.active_orders)}`",
+            "",
+            "━" * 15 + "🛡 *РИСК-МЕНЕДЖМЕНТ*" + "━" * 15,
+            f"🔴 Stop-Loss: `-{CONFIG.get('global_sl_usdt', 25):.0f} USDT`",
+            f"🟢 Take-Profit: `+{CONFIG.get('global_tp_usdt', 40):.0f} USDT`",
         ]
+
+        # Информация о существующих позициях (если есть)
+        if len(self._synced_positions) > 0:
+            lines += [
+                "",
+                "━" * 15 + "💼 *ОТКРЫТЫЕ ПОЗИЦИИ*" + "━" * 15,
+            ]
+            # Получаем актуальные данные о позициях
+            try:
+                r_pos = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                if r_pos.get("code") == "0":
+                    positions_data = r_pos.get("data", [])
+                    if positions_data:
+                        for pos in positions_data:
+                            pos_side = pos.get("posSide", "net")
+                            avg_px = float(pos.get("avgPx", 0))
+                            sz = float(pos.get("pos", 0))
+                            upl = float(pos.get("upl", 0))
+
+                            direction = "🟢 LONG" if pos_side == "long" else "🔴 SHORT" if pos_side == "short" else "⚪ NET"
+                            lines.append(f"{direction}: `{sz}` SOL @ `{avg_px:.2f}` | PnL: `{upl:+.2f}` USDT")
+                    else:
+                        lines.append("✅ Нет открытых позиций")
+            except Exception:
+                lines.append("⚠️ Не удалось загрузить позиции")
+
+        # AI сигнал
         sig = self.last_signal
-        emoji = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(sig.get("signal", "NEUTRAL"), "⚪")
+        emoji = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(
+            sig.get("signal", "NEUTRAL"), "⚪"
+        )
         lines += [
-            "", "🧠 *Multi-AI Сигнал*",
-            f"{emoji} `{sig.get('signal', '—')}` | Score: `{sig.get('score', 0)}` | Conf: `{sig.get('confidence', 0.5):.2f}`",
+            "",
+            "━" * 15 + "🧠 *AI СИГНАЛ*" + "━" * 15,
+            f"{emoji} `{sig.get('signal', '—')}`",
+            f"📊 Score: `{sig.get('score', 0):.2f}` | 🎯 Confidence: `{sig.get('confidence', 0.5):.2f}`",
         ]
+
+        # Индикаторы
         ind = sig.get("indicators", {})
         if ind:
-            lines += [f"RSI: `{ind.get('rsi', '—')}` | MACD: `{ind.get('macd_hist', '—')}`"]
+            rsi = ind.get('rsi', '—')
+            macd = ind.get('macd_hist', '—')
+            # RSI статус
+            if isinstance(rsi, (int, float)):
+                if rsi < 30:
+                    rsi_status = "🟢 Перепроданность"
+                elif rsi > 70:
+                    rsi_status = "🔴 Перекупленность"
+                else:
+                    rsi_status = "⚪ Нейтрально"
+                lines.append(f"📊 RSI: `{rsi}` {rsi_status}")
+            else:
+                lines.append(f"📊 RSI: `{rsi}`")
+            lines.append(f"📊 MACD: `{macd}`")
+
+        # Рынок
         lines += [
-            "", "🌍 *Рынок*",
-            f"Fear&Greed: `{ctx.get('fear_greed_value', 50)}/100` ({ctx.get('fear_greed_label', '—')})",
-            f"BTC: `${ctx.get('btc_price', 0):,.0f}` | Корреляция: `{ctx.get('sol_btc_correlation', 0.7)}`",
-            f"Сессия: `{ctx.get('trading_session', '—')}` | `{ctx.get('day_of_week', '—')}`",
+            "",
+            "━" * 15 + "🌍 *РЫНОК*" + "━" * 15,
+            f"😨 Fear&Greed: `{ctx.get('fear_greed_value', 50)}/100` ({ctx.get('fear_greed_label', '—')})",
+            f"₿ BTC: `${ctx.get('btc_price', 0):,.0f}`",
+            f"🔗 Корреляция SOL/BTC: `{ctx.get('sol_btc_correlation', 0.7)}`",
+            f"🕐 Сессия: `{ctx.get('trading_session', '—')}` | `{ctx.get('day_of_week', '—')}`",
         ]
+
         return "\n".join(lines)
 
     def ai_signal_text(self) -> str:
+        """Улучшенный формат AI сигнала"""
         sig = self.last_signal
-        emoji = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(sig.get("signal", "NEUTRAL"), "⚪")
-        text = f"🧠 *Multi-AI Сигнал*\n\n{emoji} *{sig.get('signal', '—')}*\nScore: `{sig.get('score', 0)}`\nConfidence: `{sig.get('confidence', 0.5):.3f}`\n\n"
-        text += "📊 *Голоса провайдеров:*\n"
+        emoji = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(
+            sig.get("signal", "NEUTRAL"), "⚪"
+        )
+
+        text = f"🧠 *AI MULTI-PROVIDER SIGNAL*\n\n"
+        text += f"{emoji} *{sig.get('signal', '—')}*\n"
+        text += f"📊 Score: `{sig.get('score', 0):.2f}`\n"
+        text += f"🎯 Confidence: `{sig.get('confidence', 0.5):.3f}`\n"
+
+        # Голоса провайдеров
+        text += "\n" + "━" * 12 + "🗳 *ГОЛОСА ПРОВАЙДЕРОВ*" + "━" * 12 + "\n"
         for name, s in sig.get("providers", {}).items():
             e = {"STRONG_BUY": "🟢🟢", "BUY": "🟢", "NEUTRAL": "⚪", "SELL": "🔴", "STRONG_SELL": "🔴🔴"}.get(s, "⚪")
-            text += f"{e} {name}: `{s}`\n"
-        text += f"\n⚖️ *Веса:*\n"
+            text += f"{e} {name.capitalize()}: `{s}`\n"
+
+        # Веса
+        text += "\n" + "━" * 12 + "⚖️ *АДАПТИВНЫЕ ВЕСА*" + "━" * 12 + "\n"
         for name, w in sorted(sig.get("weights", {}).items(), key=lambda x: -x[1]):
-            text += f"{name}: `{w:.3f}`\n"
+            text += f"• {name.capitalize()}: `{w:.3f}`\n"
+
+        # Индикаторы
         ind = sig.get("indicators", {})
         if ind:
-            text += f"\n📈 *Индикаторы:*\n"
-            text += f"RSI: `{ind.get('rsi', '—')}`\nMACD: `{ind.get('macd_hist', '—')}`\n"
-            text += f"MA20: `{ind.get('ma20', '—')}` | MA50: `{ind.get('ma50', '—')}`\n"
-            text += f"BB: `{ind.get('bb_lower', '—')} — {ind.get('bb_upper', '—')}`\n"
+            text += "\n" + "━" * 12 + "📊 *ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ*" + "━" * 12 + "\n"
+            rsi = ind.get('rsi', '—')
+            if isinstance(rsi, (int, float)):
+                if rsi < 30:
+                    rsi_status = "🟢 Перепроданность"
+                elif rsi > 70:
+                    rsi_status = "🔴 Перекупленность"
+                else:
+                    rsi_status = "⚪ Нейтрально"
+                text += f"📊 RSI(14): `{rsi}` {rsi_status}\n"
+            else:
+                text += f"📊 RSI(14): `{rsi}`\n"
+
+            macd = ind.get('macd_hist', '—')
+            if isinstance(macd, (int, float)):
+                macd_emoji = "🟢" if macd > 0 else "🔴"
+                text += f"{macd_emoji} MACD Hist: `{macd:.4f}`\n"
+            else:
+                text += f"📊 MACD Hist: `{macd}`\n"
+
+            text += f"📊 MA20: `{ind.get('ma20', '—')}`\n"
+            text += f"📊 MA50: `{ind.get('ma50', '—')}`\n"
+            text += f"📊 BB: `{ind.get('bb_lower', '—')} — {ind.get('bb_upper', '—')}`\n"
+
+        # Рынок
         ctx = self.market.get_market_context(self.last_price)
-        text += f"\n🌍 *Рынок:*\n"
-        text += f"Fear&Greed: `{ctx.get('fear_greed_value', 50)}/100` ({ctx.get('fear_greed_label', '—')})\n"
-        text += f"BTC: `${ctx.get('btc_price', 0):,.0f}`\n"
-        text += f"Корреляция SOL/BTC: `{ctx.get('sol_btc_correlation', 0.7)}`\n"
-        text += f"Сессия: `{ctx.get('trading_session', '—')}` ({ctx.get('day_of_week', '—')})\n"
-        text += f"\n📌 *Влияние:*\n"
+        text += "\n" + "━" * 12 + "🌍 *РЫНОЧНЫЙ КОНТЕКСТ*" + "━" * 12 + "\n"
+        text += f"😨 Fear&Greed: `{ctx.get('fear_greed_value', 50)}/100` ({ctx.get('fear_greed_label', '—')})\n"
+        text += f"₿ BTC: `${ctx.get('btc_price', 0):,.0f}`\n"
+        text += f"📊 Доминация BTC: `{ctx.get('btc_dominance', 54.0):.1f}%`\n"
+        text += f"🔗 Корреляция SOL/BTC: `{ctx.get('sol_btc_correlation', 0.7)}`\n"
+        text += f"🕐 Сессия: `{ctx.get('trading_session', '—')}` ({ctx.get('day_of_week', '—')})\n"
+
+        # Влияние на торговлю
+        text += "\n" + "━" * 12 + "📌 *ВЛИЯНИЕ НА ТОРГОВЛЮ*" + "━" * 12 + "\n"
         signal = sig.get("signal", "NEUTRAL")
         if signal in ("STRONG_BUY", "BUY"):
-            text += "• Полные BUY ордера"
+            text += "✅ Полные BUY ордера\n"
+            text += "📈 AI подтверждает покупку"
         elif signal == "NEUTRAL":
-            text += "• Стандартные ордера"
+            text += "⚪ Стандартные ордера\n"
+            text += "⚖️ AI не дает однозначного сигнала"
         elif signal == "SELL":
-            text += "• BUY qty × 0.5"
+            text += "⚠️ BUY qty уменьшена на 50%\n"
+            text += "🔻 AI рекомендует осторожность"
         elif signal == "STRONG_SELL":
-            text += "• BUY НЕ ставятся"
+            text += "🚫 BUY ордера пропущены\n"
+            text += "🔴 AI сильно рекомендует продажу"
+
         return text
 
 
@@ -2126,70 +2575,113 @@ def auth(update: Update) -> bool:
 
 
 def persistent_keyboard():
-    """Персистентные кнопки снизу"""
+    """Улучшенная персистентная клавиатура с быстрыми действиями"""
     return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Статус"), KeyboardButton("🧠 AI Сигнал"), KeyboardButton("💰 Баланс")],
-        [KeyboardButton("📈 Backtest"), KeyboardButton("⚙️ Настройки"), KeyboardButton("🚨 Стоп")],
+        [KeyboardButton("📊 Статус"), KeyboardButton("💰 Портфель"), KeyboardButton("📈 Позиции")],
+        [KeyboardButton("🧠 AI Анализ"), KeyboardButton("📊 Backtest"), KeyboardButton("⚙️ Настройки")],
     ], resize_keyboard=True)
 
 
 def main_keyboard():
+    """Главное inline меню - улучшенная структура"""
     return InlineKeyboardMarkup([
+        # Управление ботом
         [InlineKeyboardButton("▶️ Запустить", callback_data="start"),
+         InlineKeyboardButton("⏸ Пауза", callback_data="pause"),
          InlineKeyboardButton("⏹ Остановить", callback_data="stop")],
-        [InlineKeyboardButton("🚨 Экстренный стоп", callback_data="estop")],
-        [InlineKeyboardButton("📋 Ордера", callback_data="orders"),
-         InlineKeyboardButton("🧠 AI Детали", callback_data="ai_signal")],
+
+        # Быстрая информация
+        [InlineKeyboardButton("📊 Статус", callback_data="status"),
+         InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+         InlineKeyboardButton("📈 Позиции", callback_data="positions")],
+
+        # AI и аналитика
+        [InlineKeyboardButton("🧠 AI Сигнал", callback_data="ai_signal"),
+         InlineKeyboardButton("📊 Backtest", callback_data="backtest"),
+         InlineKeyboardButton("📋 Ордера", callback_data="orders")],
+
+        # Настройки
         [InlineKeyboardButton("⚙️ Настройки бота", callback_data="settings"),
          InlineKeyboardButton("🧠 Настройки AI", callback_data="ai_settings")],
+
+        # Экстренные действия
+        [InlineKeyboardButton("🚨 Экстренный стоп", callback_data="estop")],
     ])
 
 
 def settings_keyboard():
+    """Улучшенная клавиатура настроек"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔒 Stop-Loss", callback_data="set_sl"),
+        # Риск-менеджмент
+        [InlineKeyboardButton("🛡 Stop-Loss", callback_data="set_sl"),
          InlineKeyboardButton("🎯 Take-Profit", callback_data="set_tp")],
+
+        # Параметры сетки
         [InlineKeyboardButton("📐 Уровни сетки", callback_data="set_levels"),
          InlineKeyboardButton("📊 ATR множитель", callback_data="set_atr")],
+
+        # Размер позиции
         [InlineKeyboardButton("📦 Макс qty", callback_data="set_maxqty"),
          InlineKeyboardButton("💰 % Баланса", callback_data="set_balpct")],
+
+        # Навигация
         [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
     ])
 
 
 def ai_settings_keyboard():
+    """Улучшенная клавиатура настроек AI"""
     return InlineKeyboardMarkup([
+        # Роли и стили
         [InlineKeyboardButton("🎭 Роль", callback_data="set_ai_role"),
          InlineKeyboardButton("🎯 Стиль", callback_data="set_ai_style")],
-        [InlineKeyboardButton("⚠️ Риск", callback_data="set_ai_risk"),
+
+        # Риск и веса
+        [InlineKeyboardButton("⚠️ Риск-профиль", callback_data="set_ai_risk"),
          InlineKeyboardButton("📊 Вес BTC", callback_data="set_btc_weight")],
+
+        # Частота и адаптация
         [InlineKeyboardButton("⏱ Частота AI", callback_data="set_ai_freq"),
          InlineKeyboardButton("⚖️ Адапт. веса", callback_data="set_adaptive")],
+
+        # Навигация
         [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
     ])
 
 
-help_text = (
-    "🤖 *Grid Bot V3 — Spot Multi-AI (OKX Testnet)*\n\n"
+HELP_TEXT = (
+    "🤖 *OKX Grid Bot V3 — Multi-AI Trading*\n\n"
     "📌 *Стратегия:*\n"
-    "Спотовая торговля без плеча.\n"
-    "Покупаем SOL дешевле, продаём дороже.\n"
-    "Нет плеча → нет риска ликвидации.\n\n"
-    "📌 *Multi-AI:*\n"
-    "• Gemini 2.0 Flash\n"
-    "• Groq Llama 3.1 70B\n"
-    "• OpenRouter Llama 3 8B (free)\n"
-    "• Cohere Command R+ (free tier)\n"
-    "• DeepSeek V3 (free tier)\n"
-    "• Адаптивные веса + память 20 решений\n"
-    "• Fear&Greed, BTC корреляция, сессии\n\n"
+    "• Фьючерсы SOL-USDT-SWAP с leverage 5x\n"
+    "• Динамическая сетка на основе ATR\n"
+    "• Multi-AI анализ с 5 LLM провайдерами\n"
+    "• Adaptive weights + trade memory\n"
+    "• Multi-timeframe analysis (M5, M15, H1, H4)\n\n"
+    "📌 *AI Провайдеры:*\n"
+    "• 🟢 Groq — Trend Following (4H)\n"
+    "• 🟡 OpenRouter — Mean Reversion (1H)\n"
+    "• 🔵 Cohere — Risk Manager (консервативный)\n"
+    "• 🟣 DeepSeek — Scalping (15m)\n"
+    "• 🟠 Gemini — Market Context (multi-TF)\n\n"
     "📌 *Команды:*\n"
     "`/start` — главное меню\n"
     "`/status` — быстрый статус\n"
-    "`/ai` — AI сигнал\n"
-    "`/backtest` — точность нейронк\n"
-    "`/help` — справка\n"
-    "`/set param value` — изменить параметр\n"
+    "`/ai` — AI сигнал и аналитика\n"
+    "`/backtest` — точность AI за 7 дней\n"
+    "`/sync` — синхронизация с биржей\n"
+    "`/help` — эта справка\n"
+    "`/set param value` — изменить параметр\n\n"
+    "📌 *Быстрые кнопки:*\n"
+    "📊 Статус — текущее состояние бота\n"
+    "💰 Портфель — баланс и PnL\n"
+    "📈 Позиции — активные позиции\n"
+    "🧠 AI Анализ — детальный AI сигнал\n"
+    "📊 Backtest — статистика AI\n"
+    "⚙️ Настройки — параметры бота\n\n"
+    "📌 *При запуске:*\n"
+    "Бот автоматически синхронизирует\n"
+    "существующие ордера и позиции\n"
+    "с биржей и покажет отчет\n"
 )
 
 
@@ -2304,6 +2796,61 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Ошибка при остановке: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=persistent_keyboard())
+
+
+async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ручная синхронизация ордеров и позиций с биржей"""
+    if not auth(update): return
+
+    bot_instance = ctx.bot_data.get("bot")
+    if not bot_instance:
+        await update.message.reply_text("❌ Бот не инициализирован", reply_markup=persistent_keyboard())
+        return
+
+    msg = await update.message.reply_text("🔄 Синхронизация с биржей...", reply_markup=persistent_keyboard())
+
+    try:
+        # Вызываем синхронизацию
+        sync_result = bot_instance.sync_existing_orders_and_positions()
+
+        # Формируем ответ
+        if sync_result["orders"] > 0 or sync_result["positions"] > 0:
+            response = f"✅ *Синхронизация завершена*\n\n"
+            response += f"📋 Ордеров найдено: `{sync_result['orders']}`\n"
+            response += f"💼 Позиций найдено: `{sync_result['positions']}`\n\n"
+
+            if sync_result["positions"] > 0:
+                response += "💼 *Открытые позиции:*\n"
+                try:
+                    r_pos = bot_instance.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                    if r_pos.get("code") == "0":
+                        for pos in r_pos.get("data", []):
+                            pos_side = pos.get("posSide", "net")
+                            avg_px = float(pos.get("avgPx", 0))
+                            sz = float(pos.get("pos", 0))
+                            upl = float(pos.get("upl", 0))
+
+                            direction = "🟢 LONG" if pos_side == "long" else "🔴 SHORT" if pos_side == "short" else "⚪ NET"
+                            response += f"{direction}: `{sz}` SOL @ `{avg_px:.2f}` | PnL: `{upl:+.2f}` USDT\n"
+                except Exception:
+                    response += "⚠️ Не удалось загрузить детали позиций\n"
+
+            if sync_result["orders"] > 0:
+                response += f"\n📋 *Ордера:*\n"
+                buys = sum(1 for o in bot_instance.active_orders.values() if o["type"] == "BUY")
+                sells = sum(1 for o in bot_instance.active_orders.values() if o["type"] == "SELL")
+                response += f"🛒 BUY: `{buys}`\n"
+                response += f"📤 SELL: `{sells}`\n"
+                response += f"📊 Всего: `{sync_result['orders']}`"
+        else:
+            response = "✅ *Синхронизация завершена*\n\n"
+            response += "✅ Нет открытых ордеров или позиций"
+
+        await msg.edit_text(response, parse_mode="Markdown")
+
+    except Exception as e:
+        log.error(f"Ошибка синхронизации: {e}")
+        await msg.edit_text(f"❌ Ошибка синхронизации: {e}", parse_mode="Markdown")
 
 
 def format_settings_page() -> str:
@@ -2574,6 +3121,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -2582,14 +3130,27 @@ def main():
             ("start", "Главное меню"),
             ("status", "Статус бота"),
             ("ai", "AI сигнал"),
-            ("backtest", "Точность нейронк"),
+            ("backtest", "Точность AI"),
             ("help", "Справка"),
             ("set", "Изменить параметр"),
             ("stop", "Остановить бота"),
+            ("sync", "Синхронизация с биржей"),
         ])
 
     app.post_init = post_init
     bot.start()
+
+    # Синхронизация существующих ордеров и позиций при запуске
+    log.info("🔄 Запуск синхронизации с биржей...")
+    time.sleep(2)  # Даем боту 2 секунды на инициализацию
+    sync_result = bot.sync_existing_orders_and_positions()
+
+    # Добавляем информацию о синхронизации в лог запуска
+    if sync_result["orders"] > 0 or sync_result["positions"] > 0:
+        log.info(f"✅ Обнаружено: {sync_result['orders']} ордеров, {sync_result['positions']} позиций")
+        log.info("⚠️ Бот будет работать с существующими ордерами/позициями")
+    else:
+        log.info("✅ Бот запущен без существующих ордеров/позиций")
 
     log.info("=" * 55)
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
