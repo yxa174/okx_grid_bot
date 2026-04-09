@@ -2652,7 +2652,7 @@ def ai_settings_keyboard():
 HELP_TEXT = (
     "🤖 *OKX Grid Bot V3 — Multi-AI Trading*\n\n"
     "📌 *Стратегия:*\n"
-    "• Фьючерсы SOL-USDT-SWAP с leverage 5x\n"
+    "• Фьючерсы SOL-USDT-SWAP с leverage 10x\n"
     "• Динамическая сетка на основе ATR\n"
     "• Multi-AI анализ с 5 LLM провайдерами\n"
     "• Adaptive weights + trade memory\n"
