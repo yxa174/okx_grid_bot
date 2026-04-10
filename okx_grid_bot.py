@@ -1735,6 +1735,36 @@ class GridBotV3:
         # Получаем актуальное количество ордеров после синхронизации
         current_order_count = self.get_open_order_count()
 
+        # Если ордеров близко к лимиту — отменяем самые дальние от цены
+        if current_order_count >= MAX_ORDERS - 5:
+            log.warning(f"⚠️ Ордеров {current_order_count}/{MAX_ORDERS} — отменяю дальние от цены {price:.2f}")
+            try:
+                r = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
+                if r.get("code") == "0":
+                    orders = r.get("data", [])
+                    # Сортируем по расстоянию от текущей цены
+                    orders_with_dist = []
+                    for o in orders:
+                        px = float(o.get("px", 0))
+                        dist = abs(px - price)
+                        orders_with_dist.append((o["ordId"], px, dist))
+                    orders_with_dist.sort(key=lambda x: -x[2])  # Дальние первые
+
+                    # Отменяем дальние пока не останется 20
+                    to_cancel = orders_with_dist[:max(0, len(orders_with_dist) - 20)]
+                    for oid, px, dist in to_cancel:
+                        try:
+                            self.trade_api.cancel_order(instId=CONFIG["symbol"], ordId=oid)
+                            self.active_orders.pop(oid, None)
+                            log.info(f"  ❌ Отменён дальний ордер @ {px:.2f} (dist={dist:.2f})")
+                        except Exception:
+                            pass
+                    time.sleep(0.5)
+                    current_order_count = self.get_open_order_count()
+                    log.info(f"✅ Осталось ордеров: {current_order_count}")
+            except Exception as e:
+                log.error(f"Ошибка очистки дальних ордеров: {e}")
+
         if not has_positions:
             # Нет позиций — полная перестройка сетки
             self.cancel_all()
@@ -2404,6 +2434,9 @@ class GridBotV3:
                     )
                     ai_cooldown = CONFIG.get("ai_analysis_interval", 900) // CONFIG.get("check_interval", 30)
 
+                    # 🔥 Применяем AI сигнал к ордерам и позициям
+                    self.apply_ai_signal(price)
+
                 # Синхронизация позиций (делаем реже в low_cpu_mode)
                 if sync_cooldown > 0:
                     sync_cooldown -= 1
@@ -2444,6 +2477,105 @@ class GridBotV3:
                 log.error(f"Цикл ошибка: {e}")
                 status.add_critical(f"Цикл: {e}")
                 time.sleep(15)
+
+    def apply_ai_signal(self, price: float):
+        """
+        Применяет AI сигнал к ордерам и позициям:
+
+        STRONG_SELL → Отменяет все BUY ордера, закрывает лонг позиции
+        SELL → Отменяет дальние BUY ордера (дальше 3 уровней от цены)
+        STRONG_BUY → Увеличивает BUY qty на 50%, добавляет уровни выше
+        NEUTRAL/BUY → Без изменений
+        """
+        signal = self.last_signal.get("signal", "NEUTRAL")
+        confidence = self.last_signal.get("confidence", 0.5)
+
+        # STRONG_SELL: максимальная защита
+        if signal == "STRONG_SELL" and confidence >= 0.7:
+            # 1. Отменяем все BUY ордера
+            buy_orders = [oid for oid, o in self.active_orders.items() if o["type"] == "BUY"]
+            if buy_orders:
+                log.warning(f"🚨 STRONG_SELL (conf={confidence:.2f}) → Отменяю {len(buy_orders)} BUY ордеров!")
+                for oid in buy_orders:
+                    try:
+                        self.trade_api.cancel_order(instId=CONFIG["symbol"], ordId=oid)
+                        self.active_orders.pop(oid, None)
+                    except Exception:
+                        pass
+                self.notify(f"🚨 STRONG_SELL AI сигнал! Отменено {len(buy_orders)} BUY ордеров")
+
+            # 2. Закрываем все лонг позиции
+            try:
+                r = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+                if r.get("code") == "0":
+                    for pos in r.get("data", []):
+                        pos_side = pos.get("posSide", "net")
+                        sz = float(pos.get("pos", 0))
+                        avg_px = float(pos.get("avgPx", 0))
+                        upl = float(pos.get("upl", 0))
+
+                        if pos_side in ("long", "net") and sz > 0:
+                            log.warning(f"🚨 Закрываю лонг: {sz} SOL @ {avg_px:.2f} | UPL: {upl:+.2f}")
+                            try:
+                                close_result = self.trade_api.close_positions(
+                                    instId=CONFIG["symbol"],
+                                    mgnMode="isolated",
+                                    posSide=pos_side
+                                )
+                                if close_result.get("code") == "0":
+                                    log.info(f"✅ Лонг закрыт: {sz} SOL | PnL: {upl:+.2f}")
+                                    self.notify(f"🚨 AI закрыл лонг: {sz} SOL @ {avg_px:.2f} | PnL: {upl:+.2f}")
+                            except Exception as e:
+                                log.error(f"❌ Ошибка закрытия лонга: {e}")
+            except Exception as e:
+                log.error(f"❌ Ошибка получения позиций: {e}")
+
+        # SELL: отменяем дальние BUY ордера
+        elif signal == "SELL" and confidence >= 0.6:
+            buy_orders = [(oid, o) for oid, o in self.active_orders.items() if o["type"] == "BUY"]
+            # Сортируем по расстоянию от цены
+            buy_orders.sort(key=lambda x: price - x[1]["price"])
+
+            # Отменяем ордера дальше 3 уровней от цены
+            level_step = (self.upper - self.lower) / CONFIG["grid_levels"]
+            max_dist = level_step * 3  # 3 уровня
+            cancelled = 0
+            for oid, order in buy_orders:
+                dist = price - order["price"]
+                if dist > max_dist:
+                    try:
+                        self.trade_api.cancel_order(instId=CONFIG["symbol"], ordId=oid)
+                        self.active_orders.pop(oid, None)
+                        cancelled += 1
+                    except Exception:
+                        pass
+
+            if cancelled > 0:
+                log.info(f"🔻 SELL AI сигнал → Отменено {cancelled} дальних BUY ордеров")
+                self.notify(f"🔻 SELL AI (conf={confidence:.2f}) → Отменено {cancelled} дальних BUY")
+
+        # STRONG_BUY: увеличиваем активность покупок
+        elif signal == "STRONG_BUY" and confidence >= 0.7:
+            # Если BUY ордеров мало — добавляем дополнительные уровни
+            buy_cnt = sum(1 for o in self.active_orders.values() if o["type"] == "BUY")
+            if buy_cnt < 10:
+                # Добавляем 5 дополнительных BUY ордеров выше текущих
+                current_buy_prices = sorted([o["price"] for o in self.active_orders.values() if o["type"] == "BUY"], reverse=True)
+                highest_buy = current_buy_prices[0] if current_buy_prices else price * 0.99
+                level_step = (self.upper - self.lower) / CONFIG["grid_levels"]
+
+                added = 0
+                for i in range(1, 6):
+                    new_price = round_price(highest_buy + level_step * i)
+                    if new_price < price * 0.9995:  # Не выше текущей цены
+                        qty = self._qty_for_price(new_price)
+                        oid = self.place_buy(new_price, qty=qty, buy_price=new_price, pos_side="long")
+                        if oid:
+                            added += 1
+
+                if added > 0:
+                    log.info(f"🚀 STRONG_BUY AI сигнал → Добавлено {added} BUY ордеров выше")
+                    self.notify(f"🚀 STRONG_BUY AI (conf={confidence:.2f}) → +{added} BUY ордеров")
 
     def sync_positions(self):
         """Синхронизация позиций - проверяет открытые позиции на бирже"""
