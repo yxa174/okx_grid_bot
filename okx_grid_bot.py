@@ -2096,10 +2096,10 @@ class GridBotV3:
 
             for pos in positions_data:
                 pos_side = pos.get("posSide", "net")
-                avg_px = float(pos.get("avgPx", 0))
-                sz = float(pos.get("pos", 0))
-                upl = float(pos.get("upl", 0))
-                margin = float(pos.get("margin", 0))
+                avg_px = float(pos.get("avgPx", 0) or 0)
+                sz = float(pos.get("pos", 0) or 0)
+                upl = float(pos.get("upl", 0) or 0)
+                margin = float(pos.get("margin", 0) or 0)
 
                 if sz <= 0:
                     continue
@@ -2519,10 +2519,10 @@ class GridBotV3:
             if positions_data:
                 for pos in positions_data:
                     pos_side = pos.get("posSide", "net")
-                    avg_px = float(pos.get("avgPx", 0))
-                    sz = float(pos.get("pos", 0))
-                    upl = float(pos.get("upl", 0))
-                    margin = float(pos.get("margin", 0))
+                    avg_px = float(pos.get("avgPx", 0) or 0)
+                    sz = float(pos.get("pos", 0) or 0)
+                    upl = float(pos.get("upl", 0) or 0)
+                    margin = float(pos.get("margin", 0) or 0)
 
                     direction = "🟢 LONG" if pos_side == "long" else "🔴 SHORT" if pos_side == "short" else "⚪ NET"
 
