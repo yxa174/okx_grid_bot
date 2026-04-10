@@ -1735,35 +1735,35 @@ class GridBotV3:
         # Получаем актуальное количество ордеров после синхронизации
         current_order_count = self.get_open_order_count()
 
-        # Если ордеров близко к лимиту — отменяем самые дальние от цены
-        if current_order_count >= MAX_ORDERS - 5:
-            log.warning(f"⚠️ Ордеров {current_order_count}/{MAX_ORDERS} — отменяю дальние от цены {price:.2f}")
+        # ⚠️ Если ордеров слишком много (старые от прошлых запусков) — чистим
+        if current_order_count > 25:
+            log.warning(f"⚠️ Найдено {current_order_count} ордеров (много!) — чищу старые...")
             try:
                 r = self.trade_api.get_order_list(instType="SWAP", instId=CONFIG["symbol"], state="live")
                 if r.get("code") == "0":
                     orders = r.get("data", [])
-                    # Сортируем по расстоянию от текущей цены
+                    # Сортируем по расстоянию от текущей цены (дальние первые)
                     orders_with_dist = []
                     for o in orders:
                         px = float(o.get("px", 0))
                         dist = abs(px - price)
                         orders_with_dist.append((o["ordId"], px, dist))
-                    orders_with_dist.sort(key=lambda x: -x[2])  # Дальние первые
+                    orders_with_dist.sort(key=lambda x: -x[2])
 
-                    # Отменяем дальние пока не останется 20
-                    to_cancel = orders_with_dist[:max(0, len(orders_with_dist) - 20)]
+                    # Отменяем лишние, оставляем 15 ближайших к цене
+                    to_cancel = orders_with_dist[:max(0, len(orders_with_dist) - 15)]
                     for oid, px, dist in to_cancel:
                         try:
                             self.trade_api.cancel_order(instId=CONFIG["symbol"], ordId=oid)
                             self.active_orders.pop(oid, None)
-                            log.info(f"  ❌ Отменён дальний ордер @ {px:.2f} (dist={dist:.2f})")
+                            log.info(f"  ❌ Отменён старый ордер @ {px:.2f} (dist={dist:.2f})")
                         except Exception:
                             pass
                     time.sleep(0.5)
                     current_order_count = self.get_open_order_count()
-                    log.info(f"✅ Осталось ордеров: {current_order_count}")
+                    log.info(f"✅ После чистки осталось: {current_order_count} ордеров")
             except Exception as e:
-                log.error(f"Ошибка очистки дальних ордеров: {e}")
+                log.error(f"❌ Ошибка чистки ордеров: {e}")
 
         if not has_positions:
             # Нет позиций — полная перестройка сетки
