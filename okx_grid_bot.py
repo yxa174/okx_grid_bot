@@ -3508,7 +3508,7 @@ def start_telegram_bot():
                 try:
                     await tg_app.bot.send_message(chat_id=ALLOWED_CHAT_IDS[0], text=msg, parse_mode="Markdown")
                 except Exception as e:
-                    log.warning(f"Telegram notify error: {e}")
+                    log.debug(f"Telegram notify error: {e}")
             try:
                 loop = tg_app.loop
                 if loop and loop.is_running():
@@ -3549,6 +3549,7 @@ def start_telegram_bot():
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                # Пробуем подключиться — если ошибка, выходим тихо
                 loop.run_until_complete(tg_app.initialize())
                 loop.run_until_complete(tg_app.start())
                 loop.run_until_complete(tg_app.updater.start_polling(
@@ -3557,15 +3558,35 @@ def start_telegram_bot():
                 ))
                 loop.run_forever()
             except Exception as e:
-                log.error(f"🔴 Telegram polling error: {e}")
+                err_str = str(e)
+                if "ProxyError" in err_str or "503" in err_str:
+                    log.warning("⚠️ Telegram заблокирован прокси (PythonAnywhere free tier). Бот работает без Telegram.")
+                else:
+                    log.error(f"🔴 Telegram polling error: {e}")
+
+        # Пробуем запустить Telegram — если не получится, просто выходим
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(tg_app.initialize())
+            loop.close()
+        except Exception as e:
+            err_str = str(e)
+            if "ProxyError" in err_str or "503" in err_str:
+                log.warning("⚠️ Telegram недоступен (PythonAnywhere free tier блокирует). Бот работает без Telegram.")
+            else:
+                log.error(f"❌ Telegram init error: {e}")
+            return None
 
         thread = threading.Thread(target=run_polling_thread, daemon=True)
         thread.start()
         log.info("📱 Telegram бот запущен в фоновом потоке")
         return tg_app
     except Exception as e:
-        log.error(f"❌ Не удалось запустить Telegram бот: {e}")
-        log.warning("⚠️ Бот будет работать БЕЗ Telegram — используйте веб-дашборд")
+        err_str = str(e)
+        if "ProxyError" in err_str or "503" in err_str:
+            log.warning("⚠️ Telegram недоступен (PythonAnywhere free tier). Бот работает без Telegram.")
+        else:
+            log.error(f"❌ Не удалось запустить Telegram бот: {e}")
         return None
 
 
