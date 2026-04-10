@@ -3363,15 +3363,23 @@ def start_telegram_bot():
 
     tg_app.post_init = post_init
 
-    # Запускаем polling в фоновом потоке — БЕЗ цикла, просто run_polling()
+    # Запускаем polling в фоновом потоке
     def run_polling_thread():
+        import asyncio
         try:
-            tg_app.run_polling(
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(tg_app.initialize())
+            loop.run_until_complete(tg_app.start())
+            loop.run_until_complete(tg_app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
-            )
+            ))
+            loop.run_forever()
         except Exception as e:
             log.error(f"🔴 Telegram polling error: {e}")
+            import traceback
+            log.error(traceback.format_exc())
 
     thread = threading.Thread(target=run_polling_thread, daemon=True)
     thread.start()
