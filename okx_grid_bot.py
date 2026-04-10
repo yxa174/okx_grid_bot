@@ -237,8 +237,13 @@ class MarketDataProvider:
             return self._btc_cache
         try:
             r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10)
-            btc_price = r.json()["bitcoin"]["usd"]
-            self._btc_cache = {"price": btc_price, "dominance": 54.0, "ts": now, "ttl": 300}
+            data = r.json()
+            # CoinGecko может вернуть данные под другим ключом
+            btc_price = data.get("bitcoin", data.get("Bitcoin", 0))
+            if isinstance(btc_price, dict):
+                btc_price = btc_price.get("usd", 0)
+            if btc_price and btc_price > 0:
+                self._btc_cache = {"price": float(btc_price), "dominance": 54.0, "ts": now, "ttl": 300}
             return self._btc_cache
         except Exception as e:
             log.warning(f"BTC данные ошибка: {e}")
@@ -302,14 +307,20 @@ class MarketDataProvider:
                     # Преобразуем в удобный формат
                     ohlcv = []
                     for candle in reversed(data):  # Переворачиваем, чтобы старые были сначала
-                        ts, o, h, l, c, vol, vol_ccy, vol_ccy_quote = candle
+                        # OKX может вернуть разное кол-во полей, берём первые 6 гарантированно
+                        ts = int(candle[0])
+                        o = float(candle[1])
+                        h = float(candle[2])
+                        l = float(candle[3])
+                        c = float(candle[4])
+                        vol = float(candle[5]) if len(candle) > 5 else 0.0
                         ohlcv.append({
-                            'timestamp': int(ts),
-                            'open': float(o),
-                            'high': float(h),
-                            'low': float(l),
-                            'close': float(c),
-                            'volume': float(vol)
+                            'timestamp': ts,
+                            'open': o,
+                            'high': h,
+                            'low': l,
+                            'close': c,
+                            'volume': vol
                         })
 
                     # Вычисляем простые метрики
@@ -3305,36 +3316,39 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚨 *ЭКСТРЕННАЯ ОСТАНОВКА!*\n\n❌ Ордера отменены\n📉 Позиции закрыты", parse_mode="Markdown", reply_markup=persistent_keyboard())
 
 
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+def start_telegram_bot():
+    """Запускает Telegram бот в фоновом потоке (для WSGI)"""
+    import asyncio
+
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     def tg_notify(msg: str):
         if not ALLOWED_CHAT_IDS:
             return
         async def _send():
             try:
-                await app.bot.send_message(chat_id=ALLOWED_CHAT_IDS[0], text=msg, parse_mode="Markdown")
+                await tg_app.bot.send_message(chat_id=ALLOWED_CHAT_IDS[0], text=msg, parse_mode="Markdown")
             except Exception as e:
                 log.warning(f"Telegram notify error: {e}")
         try:
-            loop = app.loop
+            loop = tg_app.loop
             asyncio.run_coroutine_threadsafe(_send(), loop)
         except Exception:
             pass
 
     bot.set_tg_notify(tg_notify)
-    bot.set_tg_app(app)
+    bot.set_tg_app(tg_app)
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("ai", cmd_ai))
-    app.add_handler(CommandHandler("backtest", cmd_backtest))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("set", cmd_set))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("sync", cmd_sync))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("ai", cmd_ai))
+    tg_app.add_handler(CommandHandler("backtest", cmd_backtest))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(CommandHandler("set", cmd_set))
+    tg_app.add_handler(CommandHandler("stop", cmd_stop))
+    tg_app.add_handler(CommandHandler("sync", cmd_sync))
+    tg_app.add_handler(CallbackQueryHandler(callback_handler))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def post_init(application):
         await application.bot.set_my_commands([
@@ -3348,15 +3362,46 @@ def main():
             ("sync", "Синхронизация с биржей"),
         ])
 
-    app.post_init = post_init
+    tg_app.post_init = post_init
+
+    def run_polling_loop():
+        """Фоновый polling с авто-перезапуском"""
+        while True:
+            try:
+                tg_app.run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                )
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if "Conflict" in err_msg or "terminated by other" in err_msg:
+                    log.error(f"🔴 Конфликт Telegram! Жду 60 сек...")
+                    time.sleep(60)
+                elif "Server disconnected" in err_msg or "network" in err_msg.lower():
+                    log.warning(f"⚠️ Сетевая ошибка Telegram: {e}. Перезапуск через 15 сек...")
+                    time.sleep(15)
+                else:
+                    log.error(f"🔴 Ошибка Telegram polling: {e}. Перезапуск через 30 сек...")
+                    time.sleep(30)
+
+    # Запускаем polling в фоновом потоке
+    thread = threading.Thread(target=run_polling_loop, daemon=True)
+    thread.start()
+    log.info("📱 Telegram бот запущен в фоновом потоке")
+    return tg_app
+
+
+def main():
+    """Основная функция запуска (для запуска через консоль)"""
+    # Запускаем торговый бот
     bot.start()
 
     # Синхронизация существующих ордеров и позиций при запуске
     log.info("🔄 Запуск синхронизации с биржей...")
-    time.sleep(2)  # Даем боту 2 секунды на инициализацию
+    time.sleep(2)
     sync_result = bot.sync_existing_orders_and_positions()
 
-    # Добавляем информацию о синхронизации в лог запуска
     if sync_result["orders"] > 0 or sync_result["positions"] > 0:
         log.info(f"✅ Обнаружено: {sync_result['orders']} ордеров, {sync_result['positions']} позиций")
         log.info("⚠️ Бот будет работать с существующими ордерами/позициями")
@@ -3367,25 +3412,16 @@ def main():
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
     log.info("=" * 55)
 
-    # Запускаем polling с обработкой конфликтов и авто-перезапуском
-    while True:
-        try:
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-            break  # Если polling завершился корректно — выходим
-        except Exception as e:
-            err_msg = str(e)
-            if "Conflict" in err_msg or "terminated by other" in err_msg:
-                log.error(f"🔴 Конфликт Telegram! Другой экземпляр бота запущен. Жду 60 сек...")
-                time.sleep(60)
-            elif "Server disconnected" in err_msg or "network" in err_msg.lower():
-                log.warning(f"⚠️ Сетевая ошибка Telegram: {e}. Перезапуск через 15 сек...")
-                time.sleep(15)
-            else:
-                log.error(f"🔴 Ошибка Telegram polling: {e}. Перезапуск через 30 сек...")
-                time.sleep(30)
+    # Запускаем Telegram бот
+    start_telegram_bot()
+
+    # Ждём завершения (основной поток)
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("🛑 Остановка по Ctrl+C")
+        bot.stop()
 
 
 if __name__ == "__main__":
@@ -3413,7 +3449,6 @@ if __name__ == "__main__":
             wait_time = min(30 * restart_count, 120)
             log.info(f"🔄 Перезапуск через {wait_time} сек...")
             time.sleep(wait_time)
-            # Сбрасываем состояние бота
             try:
                 bot.running = False
             except Exception:
