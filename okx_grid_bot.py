@@ -1726,6 +1726,15 @@ class GridBotV3:
         except Exception:
             pass
 
+        # Если это первый запуск и active_orders пуст — синхронизируем с биржей
+        if not self.active_orders:
+            log.info(f"🔄 active_orders пуст — синхронизирую ордера с биржей...")
+            sync_result = self.sync_existing_orders_and_positions()
+            log.info(f"✅ Синхронизировано {sync_result['orders']} ордеров")
+
+        # Получаем актуальное количество ордеров после синхронизации
+        current_order_count = self.get_open_order_count()
+
         if not has_positions:
             # Нет позиций — полная перестройка сетки
             self.cancel_all()
@@ -1733,7 +1742,7 @@ class GridBotV3:
             log.info(f"🗑 Ордера отменены, размещаю новую сетку")
         else:
             # Есть позиция — не отменяем всё, только неактуальные ордера
-            log.info(f"💼 Обнаружена открытая позиция — не отменяю ордера, добавляю недостающие")
+            log.info(f"💼 Обнаружена открытая позиция — текущих ордеров: {current_order_count}")
 
         # Проверяем доступный баланс
         avail_balance = self.get_available_balance()
