@@ -3318,8 +3318,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def start_telegram_bot():
     """Запускает Telegram бот в фоновом потоке (для WSGI)"""
-    import asyncio
-
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     def tg_notify(msg: str):
@@ -3332,7 +3330,8 @@ def start_telegram_bot():
                 log.warning(f"Telegram notify error: {e}")
         try:
             loop = tg_app.loop
-            asyncio.run_coroutine_threadsafe(_send(), loop)
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(_send(), loop)
         except Exception:
             pass
 
@@ -3364,29 +3363,17 @@ def start_telegram_bot():
 
     tg_app.post_init = post_init
 
-    def run_polling_loop():
-        """Фоновый polling с авто-перезапуском"""
-        while True:
-            try:
-                tg_app.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if "Conflict" in err_msg or "terminated by other" in err_msg:
-                    log.error(f"🔴 Конфликт Telegram! Жду 60 сек...")
-                    time.sleep(60)
-                elif "Server disconnected" in err_msg or "network" in err_msg.lower():
-                    log.warning(f"⚠️ Сетевая ошибка Telegram: {e}. Перезапуск через 15 сек...")
-                    time.sleep(15)
-                else:
-                    log.error(f"🔴 Ошибка Telegram polling: {e}. Перезапуск через 30 сек...")
-                    time.sleep(30)
+    # Запускаем polling в фоновом потоке — БЕЗ цикла, просто run_polling()
+    def run_polling_thread():
+        try:
+            tg_app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+        except Exception as e:
+            log.error(f"🔴 Telegram polling error: {e}")
 
-    # Запускаем polling в фоновом потоке
-    thread = threading.Thread(target=run_polling_loop, daemon=True)
+    thread = threading.Thread(target=run_polling_thread, daemon=True)
     thread.start()
     log.info("📱 Telegram бот запущен в фоновом потоке")
     return tg_app
@@ -3394,6 +3381,9 @@ def start_telegram_bot():
 
 def main():
     """Основная функция запуска (для запуска через консоль)"""
+    # Запускаем Telegram бот ПЕРВЫМ (он в фоновом потоке)
+    start_telegram_bot()
+
     # Запускаем торговый бот
     bot.start()
 
@@ -3411,9 +3401,6 @@ def main():
     log.info("=" * 55)
     log.info("  GRID BOT V3 (Multi-AI) — OKX Testnet — запущен!")
     log.info("=" * 55)
-
-    # Запускаем Telegram бот
-    start_telegram_bot()
 
     # Ждём завершения (основной поток)
     try:
