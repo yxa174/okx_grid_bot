@@ -1716,20 +1716,53 @@ class GridBotV3:
     # ── Сетка ─────────────────────────────────────────────────────
 
     def place_grid(self, price: float):
-        self.cancel_all()
-        time.sleep(0.5)
+        """Размещает сетку ордеров. Если есть открытые позиции — не отменяет всё, а добавляет недостающие."""
+        # Проверяем, есть ли открытые позиции
+        has_positions = False
+        try:
+            r = self.account_api.get_positions(instType="SWAP", instId=CONFIG["symbol"])
+            if r.get("code") == "0":
+                has_positions = any(float(p.get("pos", 0)) > 0 for p in r.get("data", []))
+        except Exception:
+            pass
+
+        if not has_positions:
+            # Нет позиций — полная перестройка сетки
+            self.cancel_all()
+            time.sleep(0.5)
+            log.info(f"🗑 Ордера отменены, размещаю новую сетку")
+        else:
+            # Есть позиция — не отменяем всё, только неактуальные ордера
+            log.info(f"💼 Обнаружена открытая позиция — не отменяю ордера, добавляю недостающие")
+
+        # Проверяем доступный баланс
+        avail_balance = self.get_available_balance()
+        if avail_balance <= 0:
+            log.warning(f"⚠️ Нет доступного баланса для ордеров: {avail_balance:.2f} USDT")
+            self.notify(f"⚠️ Нет доступного баланса для ордеров")
+            return
 
         # Лонг: BUY ордера ниже цены (вход в лонг)
         buy_levels = [p for p in self.grid_levels if p < price * 0.9995]
+        log.info(f"📊 BUY уровней: {len(buy_levels)}, Цена: {price:.2f}, Доступно: {avail_balance:.2f} USDT")
 
         placed = 0
+        failed = 0
         for lvl in sorted(buy_levels, reverse=True):
             if self.get_open_order_count() >= MAX_ORDERS:
+                log.info(f"📋 Достигнут лимит ордеров ({MAX_ORDERS})")
                 break
             qty = self._qty_for_price(lvl)
+            if qty <= 0:
+                log.warning(f"⚠️ qty={qty} для уровня {lvl}, пропускаю")
+                continue
             result = self.place_buy(lvl, qty=qty, buy_price=lvl, pos_side="long")
             if result:
                 placed += 1
+            else:
+                failed += 1
+                if failed <= 3:  # Логируем первые 3 ошибки
+                    log.warning(f"⚠️ Не удалось поставить BUY @ {lvl}, qty={qty}")
             time.sleep(0.05)
 
         # Шорт: SELL ордера ниже цены (вход в шорт)
@@ -1739,11 +1772,15 @@ class GridBotV3:
             if self.get_open_order_count() >= MAX_ORDERS:
                 break
             qty = self._qty_for_price(lvl)
+            if qty <= 0:
+                continue
             result = self.place_sell(lvl, qty, buy_price=None, pos_side="short")
             if result:
                 placed += 1
             time.sleep(0.05)
-        self.notify(f"📐 Сетка: {placed} ордера\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT")
+
+        log.info(f"📐 Сетка: размещено {placed} ордеров (BUY={sum(1 for o in self.active_orders.values() if o['type'] == 'BUY')}, SELL={sum(1 for o in self.active_orders.values() if o['type'] == 'SELL')})")
+        self.notify(f"📐 Сетка: {placed} ордеров\nДиапазон: {self.lower:.2f} — {self.upper:.2f}\nБаланс: {self.get_balance():.2f} USDT")
 
     def _rebuild_grid_around_price(self, price: float):
         self.lower, self.upper = self.calc_atr_range(price)
@@ -2382,12 +2419,13 @@ class GridBotV3:
                     self.trailing_down(price)
                     trailing_cooldown = 30
 
-                # Пересоздание сетки если нет ордеров (редко проверяем)
+                # Пересоздание сетки если нет ордеров (с cooldown)
                 buy_cnt = sum(1 for o in self.active_orders.values() if o["type"] == "BUY")
-                if buy_cnt == 0 and cached_orders_count == 0:
+                if buy_cnt == 0 and cached_orders_count == 0 and trailing_cooldown == 0:
                     self.lower, self.upper = self.calc_atr_range(price)
                     self.grid_levels = self.build_grid(self.lower, self.upper)
                     self.place_grid(price)
+                    trailing_cooldown = 6  # Не пересоздавать сетку следующие 180 сек
 
                 # Отрисовка статуса в консоли (только если не low_cpu_mode)
                 if not low_cpu:
@@ -3318,73 +3356,76 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def start_telegram_bot():
     """Запускает Telegram бот в фоновом потоке (для WSGI)"""
-    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    import asyncio
+    try:
+        tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    def tg_notify(msg: str):
-        if not ALLOWED_CHAT_IDS:
-            return
-        async def _send():
+        def tg_notify(msg: str):
+            if not ALLOWED_CHAT_IDS:
+                return
+            async def _send():
+                try:
+                    await tg_app.bot.send_message(chat_id=ALLOWED_CHAT_IDS[0], text=msg, parse_mode="Markdown")
+                except Exception as e:
+                    log.warning(f"Telegram notify error: {e}")
             try:
-                await tg_app.bot.send_message(chat_id=ALLOWED_CHAT_IDS[0], text=msg, parse_mode="Markdown")
+                loop = tg_app.loop
+                if loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(_send(), loop)
+            except Exception:
+                pass
+
+        bot.set_tg_notify(tg_notify)
+        bot.set_tg_app(tg_app)
+
+        tg_app.add_handler(CommandHandler("start", cmd_start))
+        tg_app.add_handler(CommandHandler("status", cmd_status))
+        tg_app.add_handler(CommandHandler("ai", cmd_ai))
+        tg_app.add_handler(CommandHandler("backtest", cmd_backtest))
+        tg_app.add_handler(CommandHandler("help", cmd_help))
+        tg_app.add_handler(CommandHandler("set", cmd_set))
+        tg_app.add_handler(CommandHandler("stop", cmd_stop))
+        tg_app.add_handler(CommandHandler("sync", cmd_sync))
+        tg_app.add_handler(CallbackQueryHandler(callback_handler))
+        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+        async def post_init(application):
+            await application.bot.set_my_commands([
+                ("start", "Главное меню"),
+                ("status", "Статус бота"),
+                ("ai", "AI сигнал"),
+                ("backtest", "Точность AI"),
+                ("help", "Справка"),
+                ("set", "Изменить параметр"),
+                ("stop", "Остановить бота"),
+                ("sync", "Синхронизация с биржей"),
+            ])
+
+        tg_app.post_init = post_init
+
+        def run_polling_thread():
+            import asyncio
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(tg_app.initialize())
+                loop.run_until_complete(tg_app.start())
+                loop.run_until_complete(tg_app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                ))
+                loop.run_forever()
             except Exception as e:
-                log.warning(f"Telegram notify error: {e}")
-        try:
-            loop = tg_app.loop
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(_send(), loop)
-        except Exception:
-            pass
+                log.error(f"🔴 Telegram polling error: {e}")
 
-    bot.set_tg_notify(tg_notify)
-    bot.set_tg_app(tg_app)
-
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("status", cmd_status))
-    tg_app.add_handler(CommandHandler("ai", cmd_ai))
-    tg_app.add_handler(CommandHandler("backtest", cmd_backtest))
-    tg_app.add_handler(CommandHandler("help", cmd_help))
-    tg_app.add_handler(CommandHandler("set", cmd_set))
-    tg_app.add_handler(CommandHandler("stop", cmd_stop))
-    tg_app.add_handler(CommandHandler("sync", cmd_sync))
-    tg_app.add_handler(CallbackQueryHandler(callback_handler))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    async def post_init(application):
-        await application.bot.set_my_commands([
-            ("start", "Главное меню"),
-            ("status", "Статус бота"),
-            ("ai", "AI сигнал"),
-            ("backtest", "Точность AI"),
-            ("help", "Справка"),
-            ("set", "Изменить параметр"),
-            ("stop", "Остановить бота"),
-            ("sync", "Синхронизация с биржей"),
-        ])
-
-    tg_app.post_init = post_init
-
-    # Запускаем polling в фоновом потоке
-    def run_polling_thread():
-        import asyncio
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(tg_app.initialize())
-            loop.run_until_complete(tg_app.start())
-            loop.run_until_complete(tg_app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            ))
-            loop.run_forever()
-        except Exception as e:
-            log.error(f"🔴 Telegram polling error: {e}")
-            import traceback
-            log.error(traceback.format_exc())
-
-    thread = threading.Thread(target=run_polling_thread, daemon=True)
-    thread.start()
-    log.info("📱 Telegram бот запущен в фоновом потоке")
-    return tg_app
+        thread = threading.Thread(target=run_polling_thread, daemon=True)
+        thread.start()
+        log.info("📱 Telegram бот запущен в фоновом потоке")
+        return tg_app
+    except Exception as e:
+        log.error(f"❌ Не удалось запустить Telegram бот: {e}")
+        log.warning("⚠️ Бот будет работать БЕЗ Telegram — используйте веб-дашборд")
+        return None
 
 
 def main():
