@@ -1,3 +1,4 @@
+<img width="921" height="471" alt="Снимок экрана 2026-04-30 в 13 08 42" src="https://github.com/user-attachments/assets/9763bf4e-af26-4286-86cd-91839a93946e" />
 # 🤖 Bybit Grid Bot V2 — Long Only
 
 Автоматизированный лонг-Only grid trading бот для Bybit Testnet с AI-сигналами (LSTM) и управлением через Telegram.
